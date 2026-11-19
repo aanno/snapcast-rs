@@ -52,12 +52,14 @@ impl Controller {
         stream: Arc<Mutex<Stream>>,
     ) -> Result<Self> {
         let connection = SnapConnection::new(&settings.scheme, &settings.host, settings.port)?;
+        // Without a player that drains it, the stream must not be filled at all.
+        let stream = settings.player_stream.then_some(stream);
 
         Ok(Self {
             connection,
             settings,
             time_provider,
-            stream: Some(stream),
+            stream,
             decoder: None,
             sample_format: SampleFormat::default(),
             sample_encoding: SampleEncoding::PcmInt,
@@ -641,6 +643,75 @@ mod tests {
             payload: vec![],
         };
         assert!(ctrl.init_audio_pipeline(&header).is_err());
+    }
+
+    /// Feeds a PCM codec header and one 4-frame wire chunk through a controller
+    /// built with `player_stream`; returns (audio frames sent, chunks in the stream).
+    fn decode_one_chunk(player_stream: bool) -> (usize, usize) {
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (audio_tx, mut audio_rx) = mpsc::channel(8);
+        let time_provider = Arc::new(Mutex::new(TimeProvider::new()));
+        let stream = Arc::new(Mutex::new(Stream::new(SampleFormat::new(48000, 16, 2))));
+        let cfg = crate::ClientConfig {
+            scheme: snapcast_proto::SCHEME_TCP.into(),
+            host: "example.invalid".into(),
+            player_stream,
+            ..Default::default()
+        };
+        let mut ctrl = Controller::new(
+            cfg,
+            event_tx,
+            cmd_rx,
+            audio_tx,
+            time_provider,
+            Arc::clone(&stream),
+        )
+        .unwrap();
+        // Minimal 44-byte WAV header for 48000:16:2.
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&0u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&48000u32.to_le_bytes());
+        wav.extend_from_slice(&192000u32.to_le_bytes());
+        wav.extend_from_slice(&4u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&0u32.to_le_bytes());
+        ctrl.init_audio_pipeline(&CodecHeader {
+            codec: "pcm".into(),
+            payload: wav,
+        })
+        .unwrap();
+        ctrl.handle_message(TypedMessage {
+            base: base(MessageType::WireChunk),
+            payload: MessagePayload::WireChunk(WireChunk {
+                timestamp: Timeval { sec: 1, usec: 0 },
+                payload: vec![0u8; 16],
+            }),
+        })
+        .unwrap();
+        let frames = std::iter::from_fn(|| audio_rx.try_recv().ok()).count();
+        let chunks = stream.lock().unwrap().chunk_count();
+        (frames, chunks)
+    }
+
+    #[test]
+    fn player_stream_is_filled_by_default() {
+        assert_eq!(decode_one_chunk(true), (1, 1));
+    }
+
+    #[test]
+    fn player_stream_false_leaves_the_stream_empty() {
+        assert_eq!(
+            decode_one_chunk(false),
+            (1, 0),
+            "audio frame yes, stream no"
+        );
     }
 
     // ---- session ----

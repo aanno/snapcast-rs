@@ -191,6 +191,13 @@ pub struct ClientConfig {
     pub latency: i32,
     /// Client name sent in Hello. Default: "Snapclient".
     pub client_name: String,
+    /// Also queue every decoded chunk into [`SnapClient::stream`], for a pull-based
+    /// player (like snapclient-rs's audio output). Default: `true`.
+    ///
+    /// Set it to `false` when you only consume the [`AudioFrame`]s from the audio
+    /// channel (e.g. to schedule playback yourself): nobody drains the stream then,
+    /// so it would grow without bound.
+    pub player_stream: bool,
     /// Pre-shared key for f32lz4 decryption. `None` = auto-detect from env SNAPCAST_PSK.
     #[cfg(feature = "encryption")]
     pub encryption_psk: Option<String>,
@@ -215,6 +222,7 @@ impl Default for ClientConfig {
             host_id: String::new(),
             latency: 0,
             client_name: snapcast_proto::DEFAULT_CLIENT_NAME.into(),
+            player_stream: true,
             #[cfg(feature = "encryption")]
             encryption_psk: None,
         }
