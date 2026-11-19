@@ -79,6 +79,12 @@ pub struct AudioFrame {
     pub timestamp_usec: i64,
 }
 
+/// Time-sync replies after which [`ClientEvent::TimeSyncUsable`] is sent.
+///
+/// The clock difference is the median of all replies so far; five replies at the
+/// initial 100 ms quick-sync interval give a usable estimate after about 0.5 s.
+pub const TIME_SYNC_USABLE_REPLIES: u32 = 5;
+
 /// Events emitted by the client to the consumer.
 #[derive(Debug, Clone)]
 pub enum ClientEvent {
@@ -121,6 +127,14 @@ pub enum ClientEvent {
     },
     /// Time sync completed.
     TimeSyncComplete {
+        /// Clock difference to server in milliseconds.
+        diff_ms: f64,
+    },
+    /// Enough time-sync replies arrived to schedule audio: sent once per connection
+    /// after [`TIME_SYNC_USABLE_REPLIES`] replies, long before
+    /// [`ClientEvent::TimeSyncComplete`] (which waits for all initial quick syncs,
+    /// about 5 s). The clock difference is a median and keeps improving.
+    TimeSyncUsable {
         /// Clock difference to server in milliseconds.
         diff_ms: f64,
     },

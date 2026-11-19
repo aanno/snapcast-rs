@@ -124,6 +124,9 @@ fn main() -> anyhow::Result<()> {
                             );
                         }
                     }
+                    ClientEvent::TimeSyncUsable { diff_ms } => {
+                        tracing::debug!(diff_ms, "Time sync usable");
+                    }
                     ClientEvent::TimeSyncComplete { diff_ms } => {
                         tracing::info!(diff_ms, "Time sync complete");
                         #[cfg(target_os = "linux")]

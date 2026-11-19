@@ -37,6 +37,8 @@ pub struct Controller {
     event_tx: mpsc::Sender<ClientEvent>,
     audio_tx: mpsc::Sender<crate::AudioFrame>,
     command_rx: mpsc::Receiver<ClientCommand>,
+    /// Time-sync replies on the current connection (for `TimeSyncUsable`).
+    time_replies: u32,
 }
 
 impl Controller {
@@ -63,6 +65,7 @@ impl Controller {
             event_tx,
             audio_tx,
             command_rx,
+            time_replies: 0,
         })
     }
 
@@ -177,6 +180,7 @@ impl Controller {
         const INITIAL_QUICK_SYNCS: u32 = 50;
         let mut quick_syncs_remaining = INITIAL_QUICK_SYNCS;
         let mut quick_sync_timer = tokio::time::interval(QUICK_SYNC_INTERVAL);
+        self.time_replies = 0;
 
         self.connection
             .send(MessageType::Time, &MessagePayload::Time(Time::new()))
@@ -297,10 +301,17 @@ impl Controller {
             }
             MessagePayload::Time(t) => {
                 let s2c = msg.base.received - msg.base.sent;
-                self.time_provider
-                    .lock()
-                    .unwrap()
-                    .set_diff(&t.latency, &s2c);
+                let diff_usec = {
+                    let mut tp = self.time_provider.lock().unwrap();
+                    tp.set_diff(&t.latency, &s2c);
+                    tp.diff_to_server_usec()
+                };
+                self.time_replies += 1;
+                if self.time_replies == crate::TIME_SYNC_USABLE_REPLIES {
+                    let diff_ms = diff_usec as f64 / 1000.0;
+                    tracing::debug!(diff_ms, "Time sync usable");
+                    self.emit(ClientEvent::TimeSyncUsable { diff_ms });
+                }
             }
             MessagePayload::Error(e) => {
                 tracing::error!(code = e.code, error = %e.error, "Server error");
@@ -559,6 +570,37 @@ mod tests {
             }),
         };
         ctrl.handle_message(msg).unwrap();
+    }
+
+    #[test]
+    fn time_sync_usable_is_sent_once_after_enough_replies() {
+        let (mut ctrl, mut events, _a, _s) = make_controller();
+        let time_msg = || {
+            let mut b = base(MessageType::Time);
+            b.sent = Timeval { sec: 1, usec: 0 };
+            b.received = Timeval { sec: 1, usec: 500 };
+            TypedMessage {
+                base: b,
+                payload: MessagePayload::Time(Time {
+                    latency: Timeval { sec: 0, usec: 200 },
+                }),
+            }
+        };
+        let usable = |events: &mut mpsc::Receiver<ClientEvent>| {
+            std::iter::from_fn(|| events.try_recv().ok())
+                .filter(|e| matches!(e, ClientEvent::TimeSyncUsable { .. }))
+                .count()
+        };
+        for _ in 1..crate::TIME_SYNC_USABLE_REPLIES {
+            ctrl.handle_message(time_msg()).unwrap();
+        }
+        assert_eq!(usable(&mut events), 0, "not before enough replies");
+        ctrl.handle_message(time_msg()).unwrap();
+        assert_eq!(usable(&mut events), 1);
+        for _ in 0..10 {
+            ctrl.handle_message(time_msg()).unwrap();
+        }
+        assert_eq!(usable(&mut events), 0, "only once per connection");
     }
 
     #[test]
