@@ -535,11 +535,18 @@ fn spawn_stream_encoder(
                     *tick += chunk_dur;
                     tokio::time::sleep_until(*tick).await;
                 }
+                // Block encoders (FLAC) emit older, buffered samples first: stamp the
+                // chunk with the time of its first sample, not of the newest input.
+                let pending = enc.pending_frames();
                 match enc.encode(&frame.data) {
                     Ok(encoded) if !encoded.data.is_empty() => {
                         let _ = chunk_tx.send(WireChunkData {
                             stream_id: stream_id.clone(),
-                            timestamp_usec: frame.timestamp_usec,
+                            timestamp_usec: encoder::first_sample_timestamp_usec(
+                                frame.timestamp_usec,
+                                pending,
+                                sample_rate,
+                            ),
                             data: encoded.data,
                         });
                     }
