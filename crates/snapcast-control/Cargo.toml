@@ -1,0 +1,29 @@
+[package]
+name = "snapcast-control"
+description = "Snapcast JSON-RPC control API — embeddable control server (TCP, HTTP/WebSocket, Snapweb)"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+snapcast-server = { workspace = true }
+snapcast-proto = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
+
+# HTTP/WebSocket transport and Snapweb hosting — optional, so that embedders who
+# only need JSON-RPC over TCP don't pull in an HTTP stack.
+axum = { version = "0.8.8", features = ["ws"], optional = true }
+tower-http = { version = "0.6.8", features = ["fs"], optional = true }
+
+[features]
+default = ["http"]
+http = ["dep:axum", "dep:tower-http"]

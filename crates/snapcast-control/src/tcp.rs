@@ -1,62 +1,34 @@
 //! Control server — JSON-RPC over TCP for Snapcast control clients.
 
-use std::sync::Arc;
-
 use anyhow::{Context, Result};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc};
 
-use crate::auth::AuthConfig;
 use crate::jsonrpc::{self, RpcResult};
+use crate::{ControlEvent, ControlServer, SnapControl};
 
-/// Configuration for the control server.
-pub(crate) struct ControlConfig {
-    /// TCP bind address.
-    pub bind_address: String,
-    /// TCP port.
-    pub port: u16,
-    /// Event sender for extension point.
-    pub event_tx: mpsc::Sender<crate::ControlEvent>,
-    /// Notification broadcast sender.
-    pub notify_tx: broadcast::Sender<Value>,
-    /// Auth configuration.
-    pub auth_config: Arc<AuthConfig>,
-    /// Server command sender.
-    pub cmd_tx: tokio::sync::mpsc::Sender<snapcast_server::ServerCommand>,
-    /// Registered custom JSON-RPC methods.
-    pub registered_methods: Arc<std::collections::HashSet<String>>,
-    /// Registered custom JSON-RPC notifications.
-    pub registered_notifications: Arc<std::collections::HashSet<String>>,
-}
-
-/// Runs the JSON-RPC control server on a TCP port.
-pub(crate) async fn run_tcp(cfg: ControlConfig) -> Result<()> {
-    let listener = TcpListener::bind((cfg.bind_address.as_str(), cfg.port)).await?;
-    tracing::info!(
-        bind_address = %cfg.bind_address,
-        port = cfg.port,
-        "Control server (TCP) listening"
-    );
+/// Runs the JSON-RPC control server on a TCP listener.
+pub(crate) async fn serve<C: SnapControl + Clone + 'static>(
+    server: ControlServer<C>,
+    listener: TcpListener,
+) -> Result<()> {
+    if let Ok(addr) = listener.local_addr() {
+        tracing::info!(%addr, "Control server (TCP) listening");
+    }
 
     loop {
         let (stream, peer) = listener.accept().await?;
         tracing::debug!(%peer, "Control client connected");
 
-        let event_tx = cfg.event_tx.clone();
-        let notify_tx = cfg.notify_tx.clone();
-        let mut notify_rx = cfg.notify_tx.subscribe();
-        let auth_config = Arc::clone(&cfg.auth_config);
-        let cmd_tx = cfg.cmd_tx.clone();
-        let registered_methods = Arc::clone(&cfg.registered_methods);
-        let registered_notifications = Arc::clone(&cfg.registered_notifications);
+        let server = server.clone();
+        let mut notify_rx = server.notify_tx.subscribe();
 
         tokio::spawn(async move {
             let (reader, mut writer) = stream.into_split();
             let mut lines = BufReader::new(reader).lines();
             let client_id = peer.to_string();
-            let mut authenticated = !auth_config.enabled;
+            let mut authenticated = !server.auth.enabled;
 
             loop {
                 tokio::select! {
@@ -87,7 +59,7 @@ pub(crate) async fn run_tcp(cfg: ControlConfig) -> Result<()> {
                             continue;
                         }
 
-                        match jsonrpc::handle_request(&request, &auth_config, &cmd_tx).await {
+                        match jsonrpc::handle_request(&request, &server.auth, &server.control).await {
                             RpcResult::Response { response, notification } => {
                                 // Mark as authenticated if Server.Authenticate succeeded
                                 if method == "Server.Authenticate" && response["result"]["ok"] == true {
@@ -95,14 +67,14 @@ pub(crate) async fn run_tcp(cfg: ControlConfig) -> Result<()> {
                                 }
                                 let _ = send_json(&mut writer, &response).await;
                                 if let Some(n) = notification {
-                                    let _ = notify_tx.send(n);
+                                    server.notify(n);
                                 }
                             }
                             RpcResult::Unknown => {
-                                let method_str = method.to_string();
-                                if registered_methods.contains(&method_str) {
+                                let extensions = server.extensions.as_deref();
+                                if let Some(ext) = extensions.filter(|e| e.methods.contains(method)) {
                                     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                                    let _ = event_tx.send(crate::ControlEvent::JsonRpc {
+                                    let _ = ext.event_tx.send(ControlEvent::JsonRpc {
                                         client_id: client_id.clone(),
                                         request,
                                         response_tx: Some(resp_tx),
@@ -122,8 +94,8 @@ pub(crate) async fn run_tcp(cfg: ControlConfig) -> Result<()> {
                                             let _ = send_json(&mut writer, &err).await;
                                         }
                                     }
-                                } else if registered_notifications.contains(&method_str) {
-                                    let _ = event_tx.send(crate::ControlEvent::JsonRpc {
+                                } else if let Some(ext) = extensions.filter(|e| e.notifications.contains(method)) {
+                                    let _ = ext.event_tx.send(ControlEvent::JsonRpc {
                                         client_id: client_id.clone(),
                                         request,
                                         response_tx: None,
@@ -162,12 +134,11 @@ async fn send_json<W: AsyncWriteExt + Unpin>(writer: &mut W, value: &Value) -> R
 mod tests {
     //! Unit tests for the control-server wire framing.
     //!
-    //! The bulk of this module is the TCP accept loop in [`run_tcp`] (bind /
-    //! accept / `tokio::select!` over a `BufReader` line stream and a broadcast
+    //! The bulk of this module is the TCP accept loop in [`serve`] (accept / `tokio::select!` over a `BufReader` line stream and a broadcast
     //! receiver). That is genuine socket I/O and the request-routing / auth-gate
     //! logic is written inline inside the accept loop rather than as callable
     //! functions, so it is only reachable through a live TCP connection and is
-    //! covered by integration tests, not here. The one pure, cheaply-testable
+    //! covered by integration tests (`snapcast-tests/tests/control.rs`), not here. The one pure, cheaply-testable
     //! seam is [`send_json`], which serialises a JSON value and frames it with a
     //! trailing newline onto any `AsyncWrite`. We exercise it against an
     //! in-memory `Vec<u8>` buffer — no real sockets, fully deterministic.

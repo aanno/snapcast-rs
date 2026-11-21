@@ -4,7 +4,7 @@ use ini::Ini;
 
 use snapcast_server::ServerConfig;
 
-use crate::auth::AuthConfig;
+use snapcast_control::auth::AuthConfig;
 
 /// Binary-specific configuration (not part of the library).
 pub(crate) struct BinaryConfig {

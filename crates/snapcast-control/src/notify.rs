@@ -3,11 +3,15 @@
 //!
 //! Each notification is emitted from two independent places: as the echo of a
 //! successful `Set*` command (see `jsonrpc.rs`) and as the fan-out of an
-//! internal `ServerEvent` (see `main.rs`). Authoring the shape once here keeps
+//! internal `ServerEvent` (see [`for_event`]). Authoring the shape once here keeps
 //! those two paths byte-compatible — they were previously hand-duplicated,
 //! which is exactly how a field-name slip (e.g. `mute` vs `muted`) stays live.
 
 use serde_json::{Value, json};
+use snapcast_server::ServerEvent;
+
+use crate::SnapControl;
+use crate::jsonrpc::get_status;
 
 fn notification(method: &str, params: Value) -> Value {
     json!({"jsonrpc": "2.0", "method": method, "params": params})
@@ -53,6 +57,88 @@ pub(crate) fn group_on_stream_changed(group_id: &str, stream_id: &str) -> Value 
 /// `Group.OnNameChanged` — a group was renamed.
 pub(crate) fn group_on_name_changed(group_id: &str, name: &str) -> Value {
     notification("Group.OnNameChanged", json!({"id": group_id, "name": name}))
+}
+
+/// The JSON-RPC notification for a server event, or `None` for events that have
+/// none. Events that only name a client or stream are completed from the
+/// current status.
+pub(crate) async fn for_event<C: SnapControl>(event: &ServerEvent, control: &C) -> Option<Value> {
+    match event {
+        ServerEvent::ClientConnected { id, .. } => {
+            let client_json = client_from_status(control, id).await;
+            Some(notification(
+                "Client.OnConnect",
+                json!({"id": id, "client": client_json}),
+            ))
+        }
+        ServerEvent::ClientDisconnected { id } => {
+            let client_json = client_from_status(control, id).await;
+            Some(notification(
+                "Client.OnDisconnect",
+                json!({"id": id, "client": client_json}),
+            ))
+        }
+        ServerEvent::ClientVolumeChanged {
+            client_id,
+            volume,
+            muted,
+        } => Some(client_on_volume_changed(client_id, *volume, *muted)),
+        ServerEvent::ClientLatencyChanged { client_id, latency } => {
+            Some(client_on_latency_changed(client_id, *latency))
+        }
+        ServerEvent::ClientNameChanged { client_id, name } => {
+            Some(client_on_name_changed(client_id, name))
+        }
+        ServerEvent::GroupStreamChanged {
+            group_id,
+            stream_id,
+        } => Some(group_on_stream_changed(group_id, stream_id)),
+        ServerEvent::GroupMuteChanged { group_id, muted } => Some(group_on_mute(group_id, *muted)),
+        ServerEvent::GroupNameChanged { group_id, name } => {
+            Some(group_on_name_changed(group_id, name))
+        }
+        ServerEvent::StreamStatus { stream_id, status } => {
+            tracing::info!(stream_id, status, "Stream status");
+            // Fetch the full stream object for the notification.
+            let full_status = get_status(control).await.unwrap_or_default();
+            let stream_json = full_status["server"]["streams"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|s| s["id"].as_str() == Some(stream_id))
+                .cloned()
+                .unwrap_or_default();
+            Some(notification(
+                "Stream.OnUpdate",
+                json!({"id": stream_id, "stream": stream_json}),
+            ))
+        }
+        ServerEvent::StreamMetaChanged {
+            stream_id,
+            metadata,
+        } => Some(notification(
+            "Stream.OnProperties",
+            json!({"id": stream_id, "properties": metadata}),
+        )),
+        ServerEvent::ServerUpdated => {
+            let status = get_status(control).await.unwrap_or_default();
+            Some(notification("Server.OnUpdate", status))
+        }
+        _ => None,
+    }
+}
+
+/// Find a client in the current status by ID (`null` if unknown).
+async fn client_from_status<C: SnapControl>(control: &C, client_id: &str) -> Value {
+    let status = get_status(control).await.unwrap_or_default();
+    status["server"]["groups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|g| g["clients"].as_array().into_iter().flatten())
+        .find(|c| c["id"].as_str() == Some(client_id))
+        .cloned()
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

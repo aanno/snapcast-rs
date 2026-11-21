@@ -1,6 +1,6 @@
 //! HTTP/WebSocket control server + Snapweb static file serving.
 
-use std::sync::Arc;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use axum::Router;
@@ -9,77 +9,45 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use serde_json::Value;
-use tokio::sync::{broadcast, mpsc};
 
-use crate::auth::AuthConfig;
 use crate::jsonrpc::{self, RpcResult};
+use crate::{ControlEvent, ControlServer, SnapControl};
 
-/// Shared state for axum handlers.
-#[derive(Clone)]
-struct AppState {
-    event_tx: mpsc::Sender<crate::ControlEvent>,
-    notify_tx: broadcast::Sender<Value>,
-    auth_config: Arc<AuthConfig>,
-    cmd_tx: tokio::sync::mpsc::Sender<snapcast_server::ServerCommand>,
-}
-
-/// Configuration for the HTTP server.
-pub(crate) struct HttpConfig {
-    /// TCP bind address.
-    pub bind_address: String,
-    /// HTTP port.
-    pub port: u16,
-    /// Snapweb document root (None = disabled).
-    pub doc_root: Option<String>,
-    /// Event sender for extension point.
-    pub event_tx: mpsc::Sender<crate::ControlEvent>,
-    /// Notification broadcast sender.
-    pub notify_tx: broadcast::Sender<Value>,
-    /// Auth configuration.
-    pub auth_config: Arc<AuthConfig>,
-    /// Server command sender.
-    pub cmd_tx: tokio::sync::mpsc::Sender<snapcast_server::ServerCommand>,
-}
-
-/// Start the HTTP server with JSON-RPC + WebSocket + optional Snapweb.
-pub(crate) async fn run_http(cfg: HttpConfig) -> Result<()> {
-    let app_state = AppState {
-        event_tx: cfg.event_tx,
-        notify_tx: cfg.notify_tx,
-        auth_config: cfg.auth_config,
-        cmd_tx: cfg.cmd_tx,
-    };
-
+/// Serve JSON-RPC over HTTP POST and WebSocket, plus optional static files (Snapweb).
+pub(crate) async fn serve<C: SnapControl + Clone + 'static>(
+    server: ControlServer<C>,
+    listener: tokio::net::TcpListener,
+    doc_root: Option<PathBuf>,
+) -> Result<()> {
     let mut app = Router::new()
-        .route("/jsonrpc", get(ws_handler).post(http_jsonrpc_handler))
-        .with_state(app_state);
+        .route(
+            "/jsonrpc",
+            get(ws_handler::<C>).post(http_jsonrpc_handler::<C>),
+        )
+        .with_state(server);
 
-    if let Some(ref root) = cfg.doc_root {
-        let serve = tower_http::services::ServeDir::new(root);
-        app = app.fallback_service(serve);
-        tracing::info!(doc_root = root, "Serving Snapweb");
+    if let Some(root) = doc_root {
+        tracing::info!(doc_root = %root.display(), "Serving Snapweb");
+        app = app.fallback_service(tower_http::services::ServeDir::new(root));
     }
 
-    let listener = tokio::net::TcpListener::bind((cfg.bind_address.as_str(), cfg.port)).await?;
-    tracing::info!(
-        bind_address = %cfg.bind_address,
-        port = cfg.port,
-        "HTTP/WebSocket server listening"
-    );
+    if let Ok(addr) = listener.local_addr() {
+        tracing::info!(%addr, "HTTP/WebSocket server listening");
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }
 
 /// HTTP POST /jsonrpc handler.
-async fn http_jsonrpc_handler(
-    State(app): State<AppState>,
+async fn http_jsonrpc_handler<C: SnapControl + Clone + 'static>(
+    State(app): State<ControlServer<C>>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> impl IntoResponse {
     let auth_header = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    if let Err(e) = crate::auth::validate_bearer(&app.auth_config, auth_header) {
+    if let Err(e) = crate::auth::validate_bearer(&app.auth, auth_header) {
         return axum::Json(serde_json::json!({
             "jsonrpc": "2.0", "id": null,
             "error": {"code": -32000, "message": format!("Unauthorized: {e}")}
@@ -93,25 +61,18 @@ async fn http_jsonrpc_handler(
         }));
     };
 
-    match jsonrpc::handle_request(&request, &app.auth_config, &app.cmd_tx).await {
+    match jsonrpc::handle_request(&request, &app.auth, &app.control).await {
         RpcResult::Response {
             response,
             notification,
         } => {
             if let Some(n) = notification {
-                let _ = app.notify_tx.send(n);
+                app.notify(n);
             }
             axum::Json(response)
         }
         RpcResult::Unknown => {
-            let _ = app
-                .event_tx
-                .send(crate::ControlEvent::JsonRpc {
-                    response_tx: None,
-                    client_id: "http".into(),
-                    request,
-                })
-                .await;
+            forward_unknown(&app, "http", request).await;
             axum::Json(serde_json::json!({
                 "jsonrpc": "2.0", "id": null,
                 "error": {"code": -32601, "message": "Method not found"}
@@ -120,17 +81,34 @@ async fn http_jsonrpc_handler(
     }
 }
 
+/// Hand an unrecognized request to the embedder, if it registered for extensions.
+async fn forward_unknown<C>(app: &ControlServer<C>, client_id: &str, request: Value) {
+    if let Some(ext) = &app.extensions {
+        let _ = ext
+            .event_tx
+            .send(ControlEvent::JsonRpc {
+                response_tx: None,
+                client_id: client_id.into(),
+                request,
+            })
+            .await;
+    }
+}
+
 /// WebSocket upgrade handler at GET /jsonrpc.
-async fn ws_handler(ws: WebSocketUpgrade, State(app): State<AppState>) -> impl IntoResponse {
+async fn ws_handler<C: SnapControl + Clone + 'static>(
+    ws: WebSocketUpgrade,
+    State(app): State<ControlServer<C>>,
+) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws(socket, app))
 }
 
-async fn handle_ws(mut socket: WebSocket, app: AppState) {
+async fn handle_ws<C: SnapControl + Clone + 'static>(mut socket: WebSocket, app: ControlServer<C>) {
     let mut notify_rx = app.notify_tx.subscribe();
     // Per-connection auth state, mirroring the TCP control path. Without this
     // the WebSocket endpoint dispatched every request unauthenticated even when
     // auth was enabled (HTTP POST and TCP both gated — WS was a full bypass).
-    let mut authenticated = !app.auth_config.enabled;
+    let mut authenticated = !app.auth.enabled;
 
     loop {
         tokio::select! {
@@ -162,22 +140,18 @@ async fn handle_ws(mut socket: WebSocket, app: AppState) {
                     continue;
                 }
 
-                match jsonrpc::handle_request(&request, &app.auth_config, &app.cmd_tx).await {
+                match jsonrpc::handle_request(&request, &app.auth, &app.control).await {
                     RpcResult::Response { response, notification } => {
                         if method == "Server.Authenticate" && response["result"]["ok"] == true {
                             authenticated = true;
                         }
                         if socket.send(Message::Text(response.to_string().into())).await.is_err() { break }
                         if let Some(n) = notification {
-                            let _ = app.notify_tx.send(n);
+                            app.notify(n);
                         }
                     }
                     RpcResult::Unknown => {
-                        let _ = app.event_tx.send(crate::ControlEvent::JsonRpc {
-                            response_tx: None,
-                            client_id: "websocket".into(),
-                            request,
-                        }).await;
+                        forward_unknown(&app, "websocket", request).await;
                     }
                 }
             }
@@ -195,39 +169,42 @@ async fn handle_ws(mut socket: WebSocket, app: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthConfig;
     use serde_json::json;
     use snapcast_server::ServerCommand;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use tokio::sync::{broadcast, mpsc};
 
     // --- Test scaffolding -------------------------------------------------
     //
     // http.rs is dominated by socket I/O (TcpListener::bind, axum::serve,
-    // WebSocket recv/send, ServeDir). Those paths are NOT unit-tested here and
-    // are listed in io_excluded. What follows exercises the *pure* logic the
-    // handlers are built out of: AppState construction/wiring, the bearer-auth
+    // WebSocket recv/send, ServeDir). Those paths are NOT unit-tested here; they
+    // are covered by `snapcast-tests/tests/control.rs`. What follows exercises the *pure* logic the
+    // handlers are built out of: ControlServer construction/wiring, the bearer-auth
     // check `http_jsonrpc_handler` runs, the WS per-connection auth-gate
     // predicate, the `Server.Authenticate` success transition, and the exact
     // error-response JSON envelopes the handlers emit inline.
 
-    /// Build an `AppState` with real (but unread) channels, matching exactly how
-    /// `run_http` wires one. Returns the state plus the receivers/subscriber so a
+    type State = ControlServer<mpsc::Sender<ServerCommand>>;
+
+    /// Build the handlers' state (a `ControlServer` with extensions) with real
+    /// (but unread) channels. Returns the state plus the receivers/subscriber so a
     /// test can observe what the handler-equivalent logic sends.
     fn make_state(
         auth_config: AuthConfig,
     ) -> (
-        AppState,
-        mpsc::Receiver<crate::ControlEvent>,
+        State,
+        mpsc::Receiver<ControlEvent>,
         mpsc::Receiver<ServerCommand>,
         broadcast::Receiver<Value>,
     ) {
-        let (event_tx, event_rx) = mpsc::channel::<crate::ControlEvent>(16);
-        let (notify_tx, notify_rx) = broadcast::channel::<Value>(16);
+        let (event_tx, event_rx) = mpsc::channel::<ControlEvent>(16);
         let (cmd_tx, cmd_rx) = mpsc::channel::<ServerCommand>(16);
-        let state = AppState {
-            event_tx,
-            notify_tx,
-            auth_config: Arc::new(auth_config),
-            cmd_tx,
-        };
+        let state = ControlServer::new(cmd_tx)
+            .with_auth(auth_config)
+            .with_extensions(event_tx, HashSet::new(), HashSet::new());
+        let notify_rx = state.notify_tx.subscribe();
         (state, event_rx, cmd_rx, notify_rx)
     }
 
@@ -246,38 +223,30 @@ mod tests {
         !authenticated && method != "Server.GetToken" && method != "Server.Authenticate"
     }
 
-    // --- AppState wiring --------------------------------------------------
+    // --- State wiring -----------------------------------------------------
 
     #[test]
-    fn app_state_is_clone_and_shares_auth_arc() {
-        // `run_http` relies on AppState: Clone (Router::with_state clones per
-        // request) and on the auth_config Arc being shared, not deep-copied.
+    fn state_is_clone_and_shares_auth_arc() {
+        // `serve` relies on ControlServer: Clone (Router::with_state clones per
+        // request) and on the auth Arc being shared, not deep-copied.
         let (state, _e, _c, _n) = make_state(enabled_auth());
         let clone = state.clone();
-        assert!(Arc::ptr_eq(&state.auth_config, &clone.auth_config));
-        assert!(state.auth_config.enabled);
+        assert!(Arc::ptr_eq(&state.auth, &clone.auth));
+        assert!(state.auth.enabled);
     }
 
     #[tokio::test]
-    async fn app_state_channels_are_live() {
+    async fn state_channels_are_live() {
         // Sanity: the wired channels actually deliver, so the handler paths that
-        // do `event_tx.send` / `notify_tx.send` are talking to live endpoints.
+        // forward unknown requests / broadcast notifications reach live endpoints.
         let (state, mut event_rx, _cmd_rx, mut notify_rx) = make_state(AuthConfig::default());
 
-        state
-            .event_tx
-            .send(crate::ControlEvent::JsonRpc {
-                response_tx: None,
-                client_id: "http".into(),
-                request: json!({"method": "X"}),
-            })
-            .await
-            .unwrap();
+        forward_unknown(&state, "http", json!({"method": "X"})).await;
         match event_rx.recv().await.unwrap() {
-            crate::ControlEvent::JsonRpc { client_id, .. } => assert_eq!(client_id, "http"),
+            ControlEvent::JsonRpc { client_id, .. } => assert_eq!(client_id, "http"),
         }
 
-        state.notify_tx.send(json!({"n": 1})).unwrap();
+        state.notify(json!({"n": 1}));
         assert_eq!(notify_rx.recv().await.unwrap(), json!({"n": 1}));
     }
 
@@ -391,7 +360,7 @@ mod tests {
         // Step 1: mint a token (allowed even while unauthenticated).
         let get_token = json!({"jsonrpc": "2.0", "id": 1, "method": "Server.GetToken", "params": {"username": "bob"}});
         let RpcResult::Response { response, .. } =
-            jsonrpc::handle_request(&get_token, &state.auth_config, &state.cmd_tx).await
+            jsonrpc::handle_request(&get_token, &state.auth, &state.control).await
         else {
             panic!("expected response");
         };
@@ -400,12 +369,12 @@ mod tests {
         // Step 2: authenticate with it.
         let auth_req = json!({"jsonrpc": "2.0", "id": 2, "method": "Server.Authenticate", "params": {"token": token}});
         let RpcResult::Response { response, .. } =
-            jsonrpc::handle_request(&auth_req, &state.auth_config, &state.cmd_tx).await
+            jsonrpc::handle_request(&auth_req, &state.auth, &state.control).await
         else {
             panic!("expected response");
         };
 
-        let mut authenticated = !state.auth_config.enabled; // starts false
+        let mut authenticated = !state.auth.enabled; // starts false
         assert!(!authenticated);
         if auth_req["method"] == "Server.Authenticate" && response["result"]["ok"] == true {
             authenticated = true;
@@ -422,7 +391,7 @@ mod tests {
             "params": {"token": "not-a-valid-jwt"}
         });
         let RpcResult::Response { response, .. } =
-            jsonrpc::handle_request(&auth_req, &state.auth_config, &state.cmd_tx).await
+            jsonrpc::handle_request(&auth_req, &state.auth, &state.control).await
         else {
             panic!("expected response");
         };
@@ -430,7 +399,7 @@ mod tests {
         assert_ne!(response["result"]["ok"], true);
         assert_eq!(response["error"]["code"], -32602);
 
-        let mut authenticated = !state.auth_config.enabled;
+        let mut authenticated = !state.auth.enabled;
         if auth_req["method"] == "Server.Authenticate" && response["result"]["ok"] == true {
             authenticated = true;
         }
@@ -444,7 +413,7 @@ mod tests {
         let (state, _e, _c, _n) = make_state(AuthConfig::default());
         let req = json!({"jsonrpc": "2.0", "id": 7, "method": "Custom.DoThing", "params": {}});
         assert!(matches!(
-            jsonrpc::handle_request(&req, &state.auth_config, &state.cmd_tx).await,
+            jsonrpc::handle_request(&req, &state.auth, &state.control).await,
             RpcResult::Unknown
         ));
     }
@@ -461,12 +430,12 @@ mod tests {
             "params": {"id": "g1", "stream_id": "music"}
         });
         let RpcResult::Response { notification, .. } =
-            jsonrpc::handle_request(&req, &state.auth_config, &state.cmd_tx).await
+            jsonrpc::handle_request(&req, &state.auth, &state.control).await
         else {
             panic!("expected response");
         };
         let n = notification.expect("Group.SetStream emits a notification");
-        state.notify_tx.send(n.clone()).unwrap();
+        state.notify(n.clone());
         assert_eq!(sub.recv().await.unwrap(), n);
         assert_eq!(n["params"]["stream_id"], "music");
     }

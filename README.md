@@ -15,7 +15,7 @@ A Rust reimplementation of [Snapcast](https://github.com/snapcast/snapcast), the
 
 This project exists primarily to serve as a native Rust dependency for [SnapDog](https://github.com/SnapDogRocks/snapdog), a multiroom audio appliance. Rather than shelling out to C++ binaries or bridging through FFI, SnapDog embeds the Snapcast protocol directly as a library — receiving audio, encoding it, distributing it to clients, and controlling playback, all within a single Rust process.
 
-To make this possible, snapcast-rs separates the protocol engine from the application shell. The **library crates** (`snapcast-client`, `snapcast-server`) implement the Snapcast binary protocol, audio encoding/decoding, and time synchronization — but own no audio devices, open no HTTP ports, and read no config files. They communicate exclusively through typed Rust channels, making them straightforward to embed in any application.
+To make this possible, snapcast-rs separates the protocol engine from the application shell. The **library crates** (`snapcast-client`, `snapcast-server`) implement the Snapcast binary protocol, audio encoding/decoding, and time synchronization — but own no audio devices, open no HTTP ports, and read no config files. They communicate exclusively through typed Rust channels, making them straightforward to embed in any application. The optional **`snapcast-control`** crate adds the JSON-RPC control API (TCP, HTTP/WebSocket, Snapweb hosting) on top of an embedded server, for applications that want Snapcast controllers to manage it.
 
 The **binary crates** (`snapclient-rs`, `snapserver-rs`) are thin wrappers around these libraries. They add the things a standalone application needs: reading audio from pipes and processes, serving the JSON-RPC control API over HTTP and TCP, hosting the Snapweb UI, and outputting audio through platform-native backends via cpal. They are intended as standalone replacements for TCP-based Snapcast audio workflows; WebSocket audio streaming is not implemented yet.
 
@@ -47,6 +47,7 @@ The library crates are published on [crates.io](https://crates.io) (requires Rus
 ```bash
 cargo add snapcast-client   # embeddable client engine
 cargo add snapcast-server   # embeddable server engine
+cargo add snapcast-control  # JSON-RPC control API for an embedded server (optional)
 ```
 
 `snapcast-proto` is pulled in transitively — add it directly only if you use the wire types. The `snapclient-rs` / `snapserver-rs` binaries are **not** on crates.io; grab a pre-built one from [Releases](https://github.com/metaneutrons/snapcast-rs/releases) or build from source (see [Building](#building)).
@@ -71,8 +72,9 @@ snapcast-rs/
 ├── snapcast-proto      Protocol: binary message serialization
 ├── snapcast-client     Client library: embeddable, f32 audio output
 ├── snapcast-server     Server library: embeddable, f32 audio input
+├── snapcast-control    Control library: JSON-RPC over TCP and HTTP/WebSocket, Snapweb
 ├── snapclient-rs       Client binary: cpal audio, software + hardware (ALSA) mixer
-├── snapserver-rs       Server binary: stream readers, JSON-RPC, HTTP
+├── snapserver-rs       Server binary: stream readers, config, mDNS (control via snapcast-control)
 └── snapcast-tests      Integration tests
 ```
 
@@ -81,11 +83,12 @@ snapcast-rs/
 | [snapcast-proto](crates/snapcast-proto) | Binary protocol, message serialization | [docs.rs](https://docs.rs/snapcast-proto) |
 | [snapcast-client](crates/snapcast-client) | Client library: embeddable, f32 audio output | [docs.rs](https://docs.rs/snapcast-client) |
 | [snapcast-server](crates/snapcast-server) | Server library: embeddable, f32 audio input | [docs.rs](https://docs.rs/snapcast-server) |
+| [snapcast-control](crates/snapcast-control) | Control library: JSON-RPC over TCP and HTTP/WebSocket, Snapweb hosting | [docs.rs](https://docs.rs/snapcast-control) |
 | [snapclient-rs](crates/snapclient-rs) | Client binary: cpal audio, software + hardware (ALSA) mixer | — |
-| [snapserver-rs](crates/snapserver-rs) | Server binary: stream readers, JSON-RPC, HTTP | — |
+| [snapserver-rs](crates/snapserver-rs) | Server binary: stream readers, config, mDNS (control via snapcast-control) | — |
 | [snapcast-tests](crates/snapcast-tests) | Integration tests | — |
 
-Both libraries are pure audio engines — no device I/O, no HTTP, no config files.
+Both engine libraries are pure audio engines — no device I/O, no HTTP, no config files. `snapcast-control` is the optional layer that speaks the control protocol for an embedded server; it, too, binds no port itself.
 
 ## Client Library API
 
@@ -314,10 +317,10 @@ Rejected clients are disconnected immediately after Hello with a warning log.
 | Port | Protocol | Owner | Purpose |
 |------|----------|-------|---------|
 | 1704 | TCP | App/Binary | Binary protocol (audio + time sync) |
-| 1705 | TCP | Binary | JSON-RPC control |
-| 1780 | HTTP/WS | Binary | JSON-RPC + Snapweb UI |
+| 1705 | TCP | App/Binary | JSON-RPC control (`snapcast-control`) |
+| 1780 | HTTP/WS | App/Binary | JSON-RPC + Snapweb UI (`snapcast-control`, feature `http`) |
 
-The library crates open **no** listeners. The embedding application (or the `snapserver-rs` binary) binds every port and hands the audio listener to `server.serve(listener)`. JSON-RPC/HTTP are binary-only.
+The library crates open **no** listeners. The embedding application (or the `snapserver-rs` binary) binds every port and hands the audio listener to `server.serve(listener)`, and the control listeners to `snapcast-control` (see [Control API](#control-api)).
 
 Bind addresses are configurable:
 
@@ -326,6 +329,30 @@ snapserver-rs --stream-bind-address 127.0.0.1 --control-bind-address 127.0.0.1 -
 ```
 
 Equivalent config file keys are `bind_to_address` or `bind_address` under `[tcp-streaming]`, `[tcp-control]`, and `[http]`.
+
+## Control API
+
+`snapcast-control` serves the Snapcast JSON-RPC control API (version 2, as the C++ snapserver: `Server.GetStatus`, `Client.SetVolume`, `Group.SetStream`, `Stream.Control`, … and their notifications) for an embedded server, so controllers such as Snapweb, Snapdroid or Home Assistant can manage it:
+
+```rust
+use snapcast_control::ControlServer;
+
+let (mut server, events) = SnapServer::new(config);
+let control = ControlServer::new(server.command_sender());
+
+// Server events become notifications (Client.OnConnect, Server.OnUpdate, …);
+// every event is passed on to the application as well.
+let (app_tx, mut app_events) = tokio::sync::mpsc::channel(64);
+tokio::spawn({ let c = control.clone(); async move { c.forward_events(events, Some(app_tx)).await } });
+
+// JSON-RPC over TCP, and over HTTP POST / WebSocket with Snapweb's files.
+let tcp = TcpListener::bind(("0.0.0.0", 1705)).await?;
+tokio::spawn({ let c = control.clone(); async move { c.serve_tcp(tcp).await } });
+let http = TcpListener::bind(("0.0.0.0", 1780)).await?;
+tokio::spawn(async move { control.serve_http(http, Some("/usr/share/snapserver/snapweb".into())).await });
+```
+
+The server is reached through the `SnapControl` trait, implemented for the server's command channel; implement it yourself to put the API in front of something else (a proxy, a mock). Authentication (`Server.GetToken` / `Server.Authenticate`) is off unless configured with `with_auth`. Without the `http` feature (default on), only TCP is available and no HTTP stack is compiled in.
 
 ## Codecs
 

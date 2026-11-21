@@ -3,6 +3,7 @@
 use serde_json::{Value, json};
 
 use crate::auth::{self, AuthConfig};
+use crate::{ControlError, SnapControl};
 
 /// JSON-RPC error codes.
 const INVALID_PARAMS: i64 = -32602;
@@ -32,24 +33,17 @@ pub(crate) enum RpcResult {
     Unknown,
 }
 
-/// Fetch server status via GetStatus command, serialized to JSON.
-async fn get_status(
-    cmd_tx: &tokio::sync::mpsc::Sender<snapcast_server::ServerCommand>,
-) -> Option<Value> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    cmd_tx
-        .send(snapcast_server::ServerCommand::GetStatus { response_tx: tx })
-        .await
-        .ok()?;
-    let status = rx.await.ok()?;
+/// Fetch the server status, serialized to JSON.
+pub(crate) async fn get_status<C: SnapControl>(control: &C) -> Option<Value> {
+    let status = control.status().await.ok()?;
     serde_json::to_value(status).ok()
 }
 
-/// Handle a JSON-RPC request. All state access goes through ServerCommand.
-pub(crate) async fn handle_request(
+/// Handle a JSON-RPC request. All state access goes through [`SnapControl`].
+pub(crate) async fn handle_request<C: SnapControl>(
     request: &Value,
     auth_config: &AuthConfig,
-    cmd_tx: &tokio::sync::mpsc::Sender<snapcast_server::ServerCommand>,
+    control: &C,
 ) -> RpcResult {
     let id = &request["id"];
     let method = request["method"].as_str().unwrap_or("");
@@ -58,24 +52,20 @@ pub(crate) async fn handle_request(
     match method {
         // --- Server ---
         "Server.GetRPCVersion" => ok(id, json!({"major": 2, "minor": 0, "patch": 0})),
-        "Server.GetStatus" => match get_status(cmd_tx).await {
+        "Server.GetStatus" => match get_status(control).await {
             Some(status) => ok(id, status),
             None => err(id, INVALID_PARAMS, "status unavailable"),
         },
         "Server.DeleteClient" => {
             let client_id = require_str!(params, "id", id);
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::DeleteClient {
-                    client_id: client_id.to_string(),
-                })
-                .await;
+            let _ = control.delete_client(client_id).await;
             ok(id, json!({"id": client_id}))
         }
 
         // --- Client ---
         "Client.GetStatus" => {
             let client_id = require_str!(params, "id", id);
-            let Some(status) = get_status(cmd_tx).await else {
+            let Some(status) = get_status(control).await else {
                 return err(id, INVALID_PARAMS, "status unavailable");
             };
             let client = status["server"]["groups"]
@@ -93,13 +83,7 @@ pub(crate) async fn handle_request(
             let client_id = require_str!(params, "id", id);
             let volume = params["volume"]["percent"].as_u64().unwrap_or(100).min(100) as u16;
             let muted = params["volume"]["muted"].as_bool().unwrap_or(false);
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetClientVolume {
-                    client_id: client_id.to_string(),
-                    volume,
-                    muted,
-                })
-                .await;
+            let _ = control.set_client_volume(client_id, volume, muted).await;
             let vol = json!({"percent": volume, "muted": muted});
             ok_with_notification(
                 id,
@@ -110,12 +94,7 @@ pub(crate) async fn handle_request(
         "Client.SetLatency" => {
             let client_id = require_str!(params, "id", id);
             let latency = params["latency"].as_i64().unwrap_or(0) as i32;
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetClientLatency {
-                    client_id: client_id.to_string(),
-                    latency,
-                })
-                .await;
+            let _ = control.set_client_latency(client_id, latency).await;
             ok_with_notification(
                 id,
                 json!({"latency": latency}),
@@ -125,12 +104,7 @@ pub(crate) async fn handle_request(
         "Client.SetName" => {
             let client_id = require_str!(params, "id", id);
             let name = params["name"].as_str().unwrap_or("").to_string();
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetClientName {
-                    client_id: client_id.to_string(),
-                    name: name.clone(),
-                })
-                .await;
+            let _ = control.set_client_name(client_id, &name).await;
             ok_with_notification(
                 id,
                 json!({"name": &name}),
@@ -141,7 +115,7 @@ pub(crate) async fn handle_request(
         // --- Group ---
         "Group.GetStatus" => {
             let group_id = require_str!(params, "id", id);
-            let Some(status) = get_status(cmd_tx).await else {
+            let Some(status) = get_status(control).await else {
                 return err(id, INVALID_PARAMS, "status unavailable");
             };
             let group = status["server"]["groups"]
@@ -157,12 +131,7 @@ pub(crate) async fn handle_request(
         "Group.SetMute" => {
             let group_id = require_str!(params, "id", id);
             let muted = params["mute"].as_bool().unwrap_or(false);
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetGroupMute {
-                    group_id: group_id.to_string(),
-                    muted,
-                })
-                .await;
+            let _ = control.set_group_mute(group_id, muted).await;
             ok_with_notification(
                 id,
                 json!({"mute": muted}),
@@ -172,12 +141,7 @@ pub(crate) async fn handle_request(
         "Group.SetStream" => {
             let group_id = require_str!(params, "id", id);
             let stream_id = require_str!(params, "stream_id", id);
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetGroupStream {
-                    group_id: group_id.to_string(),
-                    stream_id: stream_id.to_string(),
-                })
-                .await;
+            let _ = control.set_group_stream(group_id, stream_id).await;
             ok_with_notification(
                 id,
                 json!({"stream_id": stream_id}),
@@ -193,24 +157,14 @@ pub(crate) async fn handle_request(
                 .iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect();
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetGroupClients {
-                    group_id: group_id.to_string(),
-                    clients: client_ids,
-                })
-                .await;
-            let status = get_status(cmd_tx).await.unwrap_or_default();
+            let _ = control.set_group_clients(group_id, client_ids).await;
+            let status = get_status(control).await.unwrap_or_default();
             ok_with_notify(id, status.clone(), "Server.OnUpdate", status)
         }
         "Group.SetName" => {
             let group_id = require_str!(params, "id", id);
             let name = params["name"].as_str().unwrap_or("").to_string();
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetGroupName {
-                    group_id: group_id.to_string(),
-                    name: name.clone(),
-                })
-                .await;
+            let _ = control.set_group_name(group_id, &name).await;
             ok_with_notification(
                 id,
                 json!({"name": &name}),
@@ -225,12 +179,7 @@ pub(crate) async fn handle_request(
                 .as_object()
                 .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                 .unwrap_or_default();
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetStreamMeta {
-                    stream_id: stream_id.to_string(),
-                    metadata,
-                })
-                .await;
+            let _ = control.set_stream_meta(stream_id, metadata).await;
             let props = params["properties"].clone();
             ok_with_notify(
                 id,
@@ -242,41 +191,26 @@ pub(crate) async fn handle_request(
         "Stream.Control" => {
             let stream_id = require_str!(params, "id", id);
             let command = require_str!(params, "command", id);
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::StreamControl {
-                    stream_id: stream_id.to_string(),
-                    command: command.to_string(),
-                    params: params["params"].clone(),
-                })
+            let _ = control
+                .stream_control(stream_id, command, params["params"].clone())
                 .await;
             ok(id, json!({"id": stream_id}))
         }
         "Stream.AddStream" => {
             let stream_uri = require_str!(params, "streamUri", id);
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::AddStream {
-                    uri: stream_uri.to_string(),
-                    response_tx: tx,
-                })
-                .await;
-            match rx.await {
-                Ok(Ok(stream_id)) => {
-                    let status = get_status(cmd_tx).await.unwrap_or_default();
+            match control.add_stream(stream_uri).await {
+                Ok(stream_id) => {
+                    let status = get_status(control).await.unwrap_or_default();
                     ok_with_notify(id, json!({"id": stream_id}), "Server.OnUpdate", status)
                 }
-                Ok(Err(e)) => err(id, INVALID_PARAMS, &e),
+                Err(ControlError::Rejected(e)) => err(id, INVALID_PARAMS, &e),
                 Err(_) => err(id, INVALID_PARAMS, "command failed"),
             }
         }
         "Stream.RemoveStream" => {
             let stream_id = require_str!(params, "id", id);
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::RemoveStream {
-                    stream_id: stream_id.to_string(),
-                })
-                .await;
-            let status = get_status(cmd_tx).await.unwrap_or_default();
+            let _ = control.remove_stream(stream_id).await;
+            let status = get_status(control).await.unwrap_or_default();
             ok_with_notify(id, json!({"id": stream_id}), "Server.OnUpdate", status)
         }
 
