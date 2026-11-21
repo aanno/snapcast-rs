@@ -15,6 +15,7 @@ use snapcast_proto::types::Timeval;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
+use tracing::Instrument;
 
 use crate::ClientSettingsUpdate;
 use crate::ServerEvent;
@@ -258,12 +259,15 @@ impl SessionServer {
             let ctx = Arc::clone(&self.ctx);
             let event_tx = event_tx.clone();
 
-            tokio::spawn(async move {
-                let result = handle_client(stream, chunk_sub, &ctx, event_tx).await;
-                if let Err(e) = result {
-                    tracing::debug!(%peer, error = %e, "Client session ended");
+            tokio::spawn(
+                async move {
+                    let result = handle_client(stream, chunk_sub, &ctx, event_tx).await;
+                    if let Err(e) = result {
+                        tracing::debug!(%peer, error = %e, "Client session ended");
+                    }
                 }
-            });
+                .in_current_span(),
+            );
         }
     }
 

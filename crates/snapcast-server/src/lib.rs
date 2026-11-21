@@ -43,10 +43,18 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Logging
+//!
+//! The server logs with [`tracing`]. Its own tasks and the per-stream encoder
+//! threads run in the tracing context of the caller of [`SnapServer::serve`],
+//! so a scoped subscriber or an enclosing span set by the embedder (for
+//! example to tag the events of one of several servers) applies to them too.
 
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc};
+use tracing::Instrument;
 
 // Re-export proto types that embedders need
 #[cfg(feature = "custom-protocol")]
@@ -501,7 +509,31 @@ pub struct SnapServer {
 ///
 /// Receives `AudioFrame`, passes `AudioData` directly to the encoder,
 /// and broadcasts encoded `WireChunkData` to sessions.
+///
+/// The thread runs in the caller's tracing context (dispatcher and current
+/// span). A new thread starts without one, so an embedder's scoped subscriber
+/// or span would otherwise miss the encoder's events.
 fn spawn_stream_encoder(
+    stream_id: String,
+    rx: mpsc::Receiver<AudioFrame>,
+    enc: Box<dyn encoder::Encoder>,
+    chunk_tx: broadcast::Sender<WireChunkData>,
+    sample_rate: u32,
+    channels: u16,
+) {
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let span = tracing::Span::current();
+    std::thread::spawn(move || {
+        tracing::dispatcher::with_default(&dispatch, || {
+            span.in_scope(|| {
+                run_stream_encoder(stream_id, rx, enc, chunk_tx, sample_rate, channels);
+            });
+        });
+    });
+}
+
+/// The encode loop of [`spawn_stream_encoder`], on its own current-thread runtime.
+fn run_stream_encoder(
     stream_id: String,
     mut rx: mpsc::Receiver<AudioFrame>,
     mut enc: Box<dyn encoder::Encoder>,
@@ -509,55 +541,55 @@ fn spawn_stream_encoder(
     sample_rate: u32,
     channels: u16,
 ) {
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("encoder runtime");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("encoder runtime");
 
-        rt.block_on(async {
-            let mut next_tick: Option<tokio::time::Instant> = None;
-            while let Some(frame) = rx.recv().await {
-                // Pace F32 sources to realtime (pipe sources pace naturally via blocking read)
-                if let AudioData::F32(ref samples) = frame.data {
-                    let num_frames = samples.len() / channels.max(1) as usize;
-                    let chunk_dur = std::time::Duration::from_micros(
-                        (num_frames as u64 * 1_000_000) / sample_rate as u64,
-                    );
-                    let now = tokio::time::Instant::now();
-                    let tick = next_tick.get_or_insert(now);
-                    // Reset on gap (>500ms behind wall clock)
-                    if now.checked_duration_since(*tick + chunk_dur)
-                        > Some(std::time::Duration::from_millis(500))
-                    {
-                        *tick = now;
-                    }
-                    *tick += chunk_dur;
-                    tokio::time::sleep_until(*tick).await;
+    tracing::debug!(stream = %stream_id, codec = enc.name(), "Stream encoder started");
+    rt.block_on(async {
+        let mut next_tick: Option<tokio::time::Instant> = None;
+        while let Some(frame) = rx.recv().await {
+            // Pace F32 sources to realtime (pipe sources pace naturally via blocking read)
+            if let AudioData::F32(ref samples) = frame.data {
+                let num_frames = samples.len() / channels.max(1) as usize;
+                let chunk_dur = std::time::Duration::from_micros(
+                    (num_frames as u64 * 1_000_000) / sample_rate as u64,
+                );
+                let now = tokio::time::Instant::now();
+                let tick = next_tick.get_or_insert(now);
+                // Reset on gap (>500ms behind wall clock)
+                if now.checked_duration_since(*tick + chunk_dur)
+                    > Some(std::time::Duration::from_millis(500))
+                {
+                    *tick = now;
                 }
-                // Block encoders (FLAC) emit older, buffered samples first: stamp the
-                // chunk with the time of its first sample, not of the newest input.
-                let pending = enc.pending_frames();
-                match enc.encode(&frame.data) {
-                    Ok(encoded) if !encoded.data.is_empty() => {
-                        let _ = chunk_tx.send(WireChunkData {
-                            stream_id: stream_id.clone(),
-                            timestamp_usec: encoder::first_sample_timestamp_usec(
-                                frame.timestamp_usec,
-                                pending,
-                                sample_rate,
-                            ),
-                            data: encoded.data,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(stream = %stream_id, error = %e, "Encode failed");
-                    }
-                    _ => {} // encoder buffering
-                }
+                *tick += chunk_dur;
+                tokio::time::sleep_until(*tick).await;
             }
-        });
+            // Block encoders (FLAC) emit older, buffered samples first: stamp the
+            // chunk with the time of its first sample, not of the newest input.
+            let pending = enc.pending_frames();
+            match enc.encode(&frame.data) {
+                Ok(encoded) if !encoded.data.is_empty() => {
+                    let _ = chunk_tx.send(WireChunkData {
+                        stream_id: stream_id.clone(),
+                        timestamp_usec: encoder::first_sample_timestamp_usec(
+                            frame.timestamp_usec,
+                            pending,
+                            sample_rate,
+                        ),
+                        data: encoded.data,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(stream = %stream_id, error = %e, "Encode failed");
+                }
+                _ => {} // encoder buffering
+            }
+        }
     });
+    tracing::debug!(stream = %stream_id, "Stream encoder stopped");
 }
 
 /// Convert f32 samples to PCM bytes at the given bit depth.
@@ -736,14 +768,17 @@ impl SnapServer {
         let session_for_run = Arc::clone(&session_srv);
         let session_event_tx = event_tx.clone();
         let session_chunk_tx = self.chunk_tx.clone();
-        let session_handle = tokio::spawn(async move {
-            if let Err(e) = session_for_run
-                .run(listener, session_chunk_tx, session_event_tx)
-                .await
-            {
-                tracing::error!(error = %e, "Session server error");
+        let session_handle = tokio::spawn(
+            async move {
+                if let Err(e) = session_for_run
+                    .run(listener, session_chunk_tx, session_event_tx)
+                    .await
+                {
+                    tracing::error!(error = %e, "Session server error");
+                }
             }
-        });
+            .in_current_span(),
+        );
 
         let dispatcher = command::Dispatcher {
             shared_state: Arc::clone(&shared_state),
