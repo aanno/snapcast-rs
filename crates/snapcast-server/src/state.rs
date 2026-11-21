@@ -49,6 +49,47 @@ pub struct Client {
     pub connected: bool,
     /// Client configuration.
     pub config: ClientConfig,
+    /// What the client reported about itself when it last connected.
+    #[serde(default)]
+    pub info: ClientInfo,
+}
+
+/// What a client reported about itself in its Hello, and where it connected from.
+/// Shown by controllers (e.g. Snapweb's client details).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientInfo {
+    /// IP address the client connected from (empty if unknown).
+    pub ip: String,
+    /// Operating system.
+    pub os: String,
+    /// CPU architecture.
+    pub arch: String,
+    /// Client software name (e.g. "Snapclient").
+    pub client_name: String,
+    /// Client software version.
+    pub client_version: String,
+    /// Stream protocol version the client speaks.
+    pub protocol_version: u32,
+    /// Instance number of the client on its host (1 for the first).
+    pub instance: u32,
+}
+
+impl ClientInfo {
+    /// The info from a client's Hello, connected from `ip`.
+    pub fn from_hello(
+        hello: &snapcast_proto::message::hello::Hello,
+        ip: Option<std::net::IpAddr>,
+    ) -> Self {
+        Self {
+            ip: ip.map(|ip| ip.to_string()).unwrap_or_default(),
+            os: hello.os.clone(),
+            arch: hello.arch.clone(),
+            client_name: hello.client_name.clone(),
+            client_version: hello.version.clone(),
+            protocol_version: hello.snap_stream_protocol_version,
+            instance: hello.instance,
+        }
+    }
 }
 
 /// A group of clients sharing the same stream.
@@ -104,6 +145,7 @@ impl ServerState {
                     mac: mac.to_string(),
                     connected: false,
                     config: ClientConfig::default(),
+                    info: ClientInfo::default(),
                 },
             );
         } else {
@@ -228,18 +270,25 @@ impl ServerState {
                         id: c.id.clone(),
                         connected: c.connected,
                         config: status::ClientConfig {
+                            instance: c.info.instance,
                             name: c.config.name.clone(),
                             volume: status::Volume {
                                 percent: c.config.volume.percent,
                                 muted: c.config.volume.muted,
                             },
                             latency: c.config.latency,
-                            ..Default::default()
                         },
                         host: status::Host {
                             name: c.host_name.clone(),
                             mac: c.mac.clone(),
-                            ..Default::default()
+                            ip: c.info.ip.clone(),
+                            os: c.info.os.clone(),
+                            arch: c.info.arch.clone(),
+                        },
+                        snapclient: status::Snapclient {
+                            name: c.info.client_name.clone(),
+                            version: c.info.client_version.clone(),
+                            protocol_version: c.info.protocol_version,
                         },
                         ..Default::default()
                     })
@@ -371,6 +420,42 @@ mod tests {
         let status = state.to_status();
         assert_eq!(status.server.groups.len(), 1);
         assert_eq!(status.server.groups[0].clients.len(), 1);
+    }
+
+    #[test]
+    fn status_reports_what_the_client_reported() {
+        let mut state = ServerState::default();
+        let c = state.get_or_create_client("aa:bb#2", "kitchen", "aa:bb");
+        c.info = ClientInfo {
+            ip: "192.168.1.5".into(),
+            os: "Linux".into(),
+            arch: "x86_64".into(),
+            client_name: "Snapclient".into(),
+            client_version: "0.31.0".into(),
+            protocol_version: 2,
+            instance: 2,
+        };
+        state.group_for_client("aa:bb#2", "default");
+
+        let json = serde_json::to_value(state.to_status()).unwrap();
+        let client = &json["server"]["groups"][0]["clients"][0];
+        assert_eq!(client["host"]["ip"], "192.168.1.5");
+        assert_eq!(client["host"]["os"], "Linux");
+        assert_eq!(client["host"]["arch"], "x86_64");
+        assert_eq!(client["host"]["name"], "kitchen");
+        assert_eq!(client["snapclient"]["name"], "Snapclient");
+        assert_eq!(client["snapclient"]["version"], "0.31.0");
+        assert_eq!(client["snapclient"]["protocolVersion"], 2);
+        assert_eq!(client["config"]["instance"], 2);
+    }
+
+    #[test]
+    fn state_without_client_info_still_loads() {
+        // State persisted before ClientInfo existed.
+        let json = r#"{"clients": {"c1": {"id": "c1", "host_name": "h", "mac": "m",
+            "connected": false, "config": {"name": ""}}}, "groups": [], "streams": []}"#;
+        let state: ServerState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.clients["c1"].info, ClientInfo::default());
     }
 
     #[test]

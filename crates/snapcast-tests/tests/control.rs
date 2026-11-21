@@ -133,6 +133,21 @@ async fn tcp_control_sees_the_client_and_changes_its_volume() {
         .collect();
     assert!(clients.contains(&client_id.as_str()), "{clients:?}");
 
+    // ... with what the client reported in its Hello, and where it connected from.
+    let info = status["result"]["server"]["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["clients"].as_array().unwrap())
+        .find(|c| c["id"] == client_id.as_str())
+        .unwrap();
+    assert_eq!(info["host"]["ip"], "127.0.0.1", "{info}");
+    assert_ne!(info["host"]["os"], "", "{info}");
+    assert_ne!(info["host"]["arch"], "", "{info}");
+    assert_ne!(info["snapclient"]["name"], "", "{info}");
+    assert_ne!(info["snapclient"]["version"], "", "{info}");
+    assert_eq!(info["config"]["instance"], 1, "{info}");
+
     // Client.SetVolume reaches the streaming client.
     let reply = ctl
         .call(

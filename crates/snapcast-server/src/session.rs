@@ -261,7 +261,8 @@ impl SessionServer {
 
             tokio::spawn(
                 async move {
-                    let result = handle_client(stream, chunk_sub, &ctx, event_tx).await;
+                    let result =
+                        handle_client(stream, Some(peer.ip()), chunk_sub, &ctx, event_tx).await;
                     if let Err(e) = result {
                         tracing::debug!(%peer, error = %e, "Client session ended");
                     }
@@ -288,6 +289,7 @@ impl SessionServer {
 
 async fn handle_client<S>(
     mut stream: S,
+    peer_ip: Option<std::net::IpAddr>,
     chunk_rx: broadcast::Receiver<WireChunkData>,
     ctx: &SessionContext,
     event_tx: mpsc::Sender<ServerEvent>,
@@ -344,6 +346,7 @@ where
         let mut s = ctx.shared_state.lock().await;
         let c = s.get_or_create_client(&client_id, &hello.host_name, &hello.mac);
         c.connected = true;
+        c.info = crate::state::ClientInfo::from_hello(&hello, peer_ip);
         client_settings = ServerSettings {
             buffer_ms: ctx.buffer_ms,
             latency: c.config.latency,
