@@ -137,7 +137,7 @@ impl Controller {
             host_name: hostname(),
             version: VERSION.to_string(),
             client_name: self.settings.client_name.clone(),
-            os: std::env::consts::OS.to_string(),
+            os: os_name().to_string(),
             arch: std::env::consts::ARCH.to_string(),
             instance: self.settings.instance,
             id: host_id,
@@ -400,6 +400,37 @@ fn hostname() -> String {
     hostname::get()
         .map(|h| h.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// The operating system as the C++ snapclient reports it: the distribution's
+/// pretty name (`PRETTY_NAME` in `/etc/os-release`, or OpenWrt's
+/// `DISTRIB_DESCRIPTION`), else Rust's OS name (`linux`, `macos`, `android`, …).
+/// Read once and cached.
+fn os_name() -> &'static str {
+    static OS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    OS.get_or_init(|| {
+        [
+            ("/etc/os-release", "PRETTY_NAME"),
+            ("/etc/openwrt_release", "DISTRIB_DESCRIPTION"),
+        ]
+        .iter()
+        .find_map(|(path, key)| release_value(&std::fs::read_to_string(path).ok()?, key))
+        .unwrap_or_else(|| std::env::consts::OS.to_string())
+    })
+}
+
+/// The value of `key` in an os-release style file (`KEY="value"`), unquoted;
+/// `None` if missing or empty.
+fn release_value(content: &str, key: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let value = line
+            .trim()
+            .strip_prefix(key)?
+            .trim_start()
+            .strip_prefix('=')?;
+        let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+        (!value.is_empty()).then(|| value.to_string())
+    })
 }
 
 fn get_mac_address() -> String {
@@ -731,5 +762,28 @@ mod tests {
         let mut ctrl =
             Controller::new(cfg, event_tx, cmd_rx, audio_tx, time_provider, stream).unwrap();
         assert!(ctrl.session().await.is_err());
+    }
+
+    #[test]
+    fn release_value_reads_os_release_and_openwrt_files() {
+        let os_release =
+            "NAME=\"Debian GNU/Linux\"\nPRETTY_NAME=\"Debian GNU/Linux 13 (trixie)\"\nID=debian\n";
+        assert_eq!(
+            release_value(os_release, "PRETTY_NAME").as_deref(),
+            Some("Debian GNU/Linux 13 (trixie)")
+        );
+        let openwrt = "DISTRIB_ID='OpenWrt'\nDISTRIB_DESCRIPTION='OpenWrt 23.05.3 r23809'\n";
+        assert_eq!(
+            release_value(openwrt, "DISTRIB_DESCRIPTION").as_deref(),
+            Some("OpenWrt 23.05.3 r23809")
+        );
+        assert_eq!(release_value("PRETTY_NAME=\"\"\n", "PRETTY_NAME"), None);
+        assert_eq!(release_value("PRETTY_NAME_X=a\n", "PRETTY_NAME"), None);
+        assert_eq!(release_value(os_release, "VERSION"), None);
+    }
+
+    #[test]
+    fn os_name_is_never_empty() {
+        assert!(!os_name().is_empty());
     }
 }
