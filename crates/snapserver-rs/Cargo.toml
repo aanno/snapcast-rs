@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 snapcast-server = { workspace = true }
-snapcast-control = { workspace = true }
+snapcast-control = { workspace = true, features = ["auth"] }
 snapcast-proto = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }

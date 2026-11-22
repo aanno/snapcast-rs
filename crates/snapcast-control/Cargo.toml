@@ -17,7 +17,9 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
+# JWT authentication (Server.GetToken / Server.Authenticate) — optional: it brings
+# RSA and elliptic-curve crypto, which embedders without authentication don't need.
+jsonwebtoken = { version = "10.3", features = ["rust_crypto"], optional = true }
 
 # HTTP/WebSocket transport and Snapweb hosting — optional, so that embedders who
 # only need JSON-RPC over TCP don't pull in an HTTP stack.
@@ -27,3 +29,5 @@ tower-http = { version = "0.6.8", features = ["fs"], optional = true }
 [features]
 default = ["http"]
 http = ["dep:axum", "dep:tower-http"]
+# JWT authentication. Without it, an enabled AuthConfig fails closed (see `auth`).
+auth = ["dep:jsonwebtoken"]

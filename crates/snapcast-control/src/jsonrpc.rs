@@ -872,6 +872,7 @@ mod tests {
 
     // --- Auth ------------------------------------------------------------
 
+    #[cfg(feature = "auth")] // needs real tokens
     #[tokio::test]
     async fn server_get_token_with_enabled_auth() {
         let (auth_config, cmd_tx) = auth_enabled();
@@ -886,6 +887,7 @@ mod tests {
         assert_eq!(auth::validate_token(&auth_config, token).unwrap(), "bob");
     }
 
+    #[cfg(feature = "auth")] // needs real tokens
     #[tokio::test]
     async fn server_get_token_defaults_to_anonymous() {
         let (auth_config, cmd_tx) = auth_enabled();
@@ -916,6 +918,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "auth")] // needs real tokens
     #[tokio::test]
     async fn server_authenticate_valid_token() {
         let (auth_config, cmd_tx) = auth_enabled();

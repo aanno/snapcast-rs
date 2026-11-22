@@ -63,7 +63,7 @@ Details: [Client Features](#client-features), [Server Features](#server-features
 | `snapcast-proto` | `custom-protocol` † | — |
 | `snapcast-client` | `f32lz4` †, `encryption` † (implies `f32lz4`), `resampler`, `custom-protocol` †, `websocket` / `tls` (experimental, implies `websocket`) | — |
 | `snapcast-server` | `flac` ✱, `opus`, `vorbis`, `f32lz4` †, `encryption` † (implies `f32lz4`), `custom-protocol` † | `opus`: libopus, `vorbis`: libvorbis |
-| `snapcast-control` | `http` ✱ (HTTP/WebSocket and static files via axum; without it TCP only) | — |
+| `snapcast-control` | `http` ✱ (HTTP/WebSocket and static files via axum; without it TCP only), `auth` (JWT for `Server.GetToken`/`Server.Authenticate`; without it an enabled auth config fails closed; `snapserver-rs` enables it) | — |
 | `snapclient-rs` | `mdns` ✱, `f32lz4` ✱ †, and `websocket`, `tls`, `resampler`, `custom-protocol` †, `encryption` † passed on to `snapcast-client` | — |
 | `snapserver-rs` | `flac` ✱, `mdns` ✱, and `opus`, `vorbis`, `f32lz4` †, `custom-protocol` †, `encryption` † passed on to `snapcast-server` | `mdns`: dns_sd (Avahi's compat library on Linux), plus the codecs' |
 
@@ -382,7 +382,7 @@ let http = TcpListener::bind(("0.0.0.0", 1780)).await?;
 tokio::spawn(async move { control.serve_http(http, Some("/usr/share/snapserver/snapweb".into())).await });
 ```
 
-The server is reached through the `SnapControl` trait, implemented for the server's command channel; implement it yourself to put the API in front of something else (a proxy, a mock). Authentication (`Server.GetToken` / `Server.Authenticate`) is off unless configured with `with_auth`. Without the `http` feature (default on), only TCP is available and no HTTP stack is compiled in.
+The server is reached through the `SnapControl` trait, implemented for the server's command channel; implement it yourself to put the API in front of something else (a proxy, a mock). Authentication (`Server.GetToken` / `Server.Authenticate`) is off unless configured with `with_auth`, and needs the `auth` feature (off by default; it brings RSA and elliptic-curve crypto). Without the feature, an enabled `AuthConfig` fails closed: `AuthConfig::validate` refuses it and every protected request is unauthorized. Without the `http` feature (default on), only TCP is available and no HTTP stack is compiled in.
 
 ## Codecs
 

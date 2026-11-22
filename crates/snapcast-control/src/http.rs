@@ -272,6 +272,7 @@ mod tests {
         assert!(crate::auth::validate_bearer(&cfg, Some("Bearer not-a-jwt")).is_err());
     }
 
+    #[cfg(feature = "auth")] // needs real tokens
     #[test]
     fn bearer_check_accepts_valid_token_when_enabled() {
         let cfg = enabled_auth();
@@ -350,6 +351,7 @@ mod tests {
 
     // --- Dispatch path the handlers call: jsonrpc::handle_request ---------
 
+    #[cfg(feature = "auth")] // needs real tokens
     #[tokio::test]
     async fn handler_dispatch_authenticate_success_flips_auth_state() {
         // Reproduces the two-step WS bootstrap: GetToken then Authenticate, and

@@ -1,10 +1,23 @@
 //! Authentication — JWT token generation and validation.
+//!
+//! The JWT code needs the feature `auth` (default). Without it, [`AuthConfig`] still
+//! exists, so the API is the same, but authentication fails closed: an enabled
+//! config is refused by [`AuthConfig::validate`], no token is issued or accepted,
+//! and every protected request is unauthorized.
 
 use anyhow::Result;
+#[cfg(feature = "auth")]
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
+#[cfg(feature = "auth")]
 use serde::{Deserialize, Serialize};
 
+/// Why authentication cannot work in a build without the feature `auth`.
+#[cfg(not(feature = "auth"))]
+const NOT_COMPILED_IN: &str =
+    "authentication is not available: snapcast-control was built without the feature `auth`";
+
 /// JWT claims.
+#[cfg(feature = "auth")]
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
     /// Subject (client ID or username).
@@ -28,11 +41,16 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-    /// Reject an inconsistent configuration (enabled without a secret).
+    /// Reject an inconsistent configuration (enabled without a secret, or enabled
+    /// in a build without the feature `auth`).
     ///
     /// Call this at startup and refuse to run on error — an enabled-but-
     /// secretless config would otherwise sign tokens with an empty key.
     pub fn validate(&self) -> Result<()> {
+        #[cfg(not(feature = "auth"))]
+        if self.enabled {
+            anyhow::bail!("{NOT_COMPILED_IN}");
+        }
         if self.enabled && self.secret.trim().is_empty() {
             anyhow::bail!(
                 "authentication is enabled but no secret is configured \
@@ -56,6 +74,7 @@ pub fn validate_bearer(config: &AuthConfig, header: Option<&str>) -> Result<Stri
 }
 
 /// Generate a JWT token for the given subject.
+#[cfg(feature = "auth")]
 pub fn generate_token(config: &AuthConfig, subject: &str) -> Result<String> {
     if config.secret.is_empty() {
         anyhow::bail!("cannot issue token: auth secret is not configured");
@@ -79,7 +98,21 @@ pub fn generate_token(config: &AuthConfig, subject: &str) -> Result<String> {
     Ok(token)
 }
 
+/// Generate a JWT token: always an error without the feature `auth`.
+#[cfg(not(feature = "auth"))]
+pub fn generate_token(_config: &AuthConfig, _subject: &str) -> Result<String> {
+    anyhow::bail!("{NOT_COMPILED_IN}")
+}
+
+/// Validate a JWT token: always an error without the feature `auth`, so an
+/// enabled config lets nobody in.
+#[cfg(not(feature = "auth"))]
+pub fn validate_token(_config: &AuthConfig, _token: &str) -> Result<String> {
+    anyhow::bail!("{NOT_COMPILED_IN}")
+}
+
 /// Validate a JWT token. Returns the subject if valid.
+#[cfg(feature = "auth")]
 pub fn validate_token(config: &AuthConfig, token: &str) -> Result<String> {
     if config.secret.is_empty() {
         anyhow::bail!("cannot validate token: auth secret is not configured");
@@ -100,6 +133,7 @@ pub fn validate_token(config: &AuthConfig, token: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "auth")]
     #[test]
     fn token_roundtrip() {
         let config = AuthConfig {
@@ -111,6 +145,7 @@ mod tests {
         assert_eq!(subject, "user1");
     }
 
+    #[cfg(feature = "auth")]
     #[test]
     fn invalid_token() {
         let config = AuthConfig {
@@ -120,6 +155,7 @@ mod tests {
         assert!(validate_token(&config, "garbage").is_err());
     }
 
+    #[cfg(feature = "auth")]
     #[test]
     fn wrong_secret() {
         let config1 = AuthConfig {
@@ -160,5 +196,22 @@ mod tests {
         };
         assert!(generate_token(&config, "user1").is_err());
         assert!(validate_token(&config, "any.token.value").is_err());
+    }
+
+    /// Without the feature, an enabled config fails closed everywhere.
+    #[cfg(not(feature = "auth"))]
+    #[test]
+    fn without_the_feature_auth_fails_closed() {
+        let config = AuthConfig {
+            enabled: true,
+            secret: "test-secret-must-be-32-bytes-long".into(),
+        };
+        assert!(config.validate().is_err());
+        assert!(generate_token(&config, "user1").is_err());
+        assert!(validate_token(&config, "any.token.value").is_err());
+        assert!(validate_bearer(&config, Some("Bearer any.token.value")).is_err());
+        // Disabled stays open, as with the feature.
+        assert!(AuthConfig::default().validate().is_ok());
+        assert!(validate_bearer(&AuthConfig::default(), None).is_ok());
     }
 }

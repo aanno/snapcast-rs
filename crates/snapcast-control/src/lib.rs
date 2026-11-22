@@ -140,7 +140,8 @@ impl<C: SnapControl + Clone + 'static> ControlServer<C> {
     }
 
     /// Require authentication (`Server.GetToken` / `Server.Authenticate`) as
-    /// configured. Call [`AuthConfig::validate`] first.
+    /// configured. Call [`AuthConfig::validate`] first. Needs the feature `auth`;
+    /// without it an enabled config fails closed (see [`auth`]).
     pub fn with_auth(mut self, auth: AuthConfig) -> Self {
         self.auth = Arc::new(auth);
         self
