@@ -52,6 +52,26 @@ cargo add snapcast-control  # JSON-RPC control API for an embedded server (optio
 
 `snapcast-proto` is pulled in transitively — add it directly only if you use the wire types. The `snapclient-rs` / `snapserver-rs` binaries are **not** on crates.io; grab a pre-built one from [Releases](https://github.com/metaneutrons/snapcast-rs/releases) or build from source (see [Building](#building)).
 
+## Build Features
+
+Cargo features per crate (✱ = default; † = not compatible with the C++ Snapcast, see above).
+Details: [Client Features](#client-features), [Server Features](#server-features),
+[Control API](#control-api).
+
+| Crate | Features | C dependency |
+|-------|----------|--------------|
+| `snapcast-proto` | `custom-protocol` † | — |
+| `snapcast-client` | `f32lz4` †, `encryption` † (implies `f32lz4`), `resampler`, `custom-protocol` †, `websocket` / `tls` (experimental, implies `websocket`) | — |
+| `snapcast-server` | `flac` ✱, `opus`, `vorbis`, `f32lz4` †, `encryption` † (implies `f32lz4`), `custom-protocol` † | `opus`: libopus, `vorbis`: libvorbis |
+| `snapcast-control` | `http` ✱ (HTTP/WebSocket and static files via axum; without it TCP only) | — |
+| `snapclient-rs` | `mdns` ✱, `f32lz4` ✱ †, and `websocket`, `tls`, `resampler`, `custom-protocol` †, `encryption` † passed on to `snapcast-client` | — |
+| `snapserver-rs` | `flac` ✱, `mdns` ✱, and `opus`, `vorbis`, `f32lz4` †, `custom-protocol` †, `encryption` † passed on to `snapcast-server` | `mdns`: dns_sd (Avahi's compat library on Linux), plus the codecs' |
+
+```bash
+cargo build -p snapserver-rs --features opus,vorbis   # more codecs for the binary
+cargo add snapcast-server --no-default-features        # PCM only, no FLAC encoder
+```
+
 ## Key Features
 
 - **Dynamic Audio Pipeline**: The client automatically re-initializes the audio device when the server changes sample rate or channels.
