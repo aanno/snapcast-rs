@@ -78,6 +78,27 @@ struct SessionContext {
 }
 
 impl SessionContext {
+    /// The stream a new client's group starts on: the configured default (the
+    /// first stream of `serve()`) while it can play, otherwise the first stream
+    /// in the state that can (the default may have been removed at runtime).
+    fn default_stream_for(
+        state: &crate::state::ServerState,
+        configured: &str,
+        playable: &[String],
+    ) -> String {
+        let can_play = |id: &str| playable.iter().any(|p| p == id);
+        if can_play(configured) {
+            return configured.to_string();
+        }
+        state
+            .streams
+            .iter()
+            .map(|st| st.id.as_str())
+            .find(|id| can_play(id))
+            .unwrap_or(configured)
+            .to_string()
+    }
+
     /// Build routing for a single client from server state.
     /// State lock must be held by caller.
     fn build_routing(state: &crate::state::ServerState, client_id: &str) -> Option<SessionRouting> {
@@ -207,6 +228,11 @@ impl SessionServer {
                 header: header.to_vec(),
             },
         );
+    }
+
+    /// Forget a removed stream's codec header.
+    pub async fn unregister_stream_codec(&self, stream_id: &str) {
+        self.ctx.codec_headers.lock().await.remove(stream_id);
     }
 
     /// Push a settings update to a specific streaming client.
@@ -342,8 +368,12 @@ where
     let initial_stream_id;
     let initial_routing;
     let client_settings;
+    // Streams with a codec header are the ones that can play (lock 4 alone, see
+    // the lock ordering on `SessionContext`).
+    let playable: Vec<String> = ctx.codec_headers.lock().await.keys().cloned().collect();
     {
         let mut s = ctx.shared_state.lock().await;
+        let default_stream = SessionContext::default_stream_for(&s, &ctx.default_stream, &playable);
         let c = s.get_or_create_client(&client_id, &hello.host_name, &hello.mac);
         c.connected = true;
         c.info = crate::state::ClientInfo::from_hello(&hello, peer_ip);
@@ -353,11 +383,11 @@ where
             volume: c.config.volume.percent,
             muted: c.config.volume.muted,
         };
-        s.group_for_client(&client_id, &ctx.default_stream);
+        s.group_for_client(&client_id, &default_stream);
 
         initial_routing =
             SessionContext::build_routing(&s, &client_id).unwrap_or_else(|| SessionRouting {
-                stream_id: ctx.default_stream.clone(),
+                stream_id: default_stream.clone(),
                 client_muted: false,
                 group_muted: false,
             });
@@ -878,5 +908,34 @@ mod tests {
         assert!(should_send_chunk(&chunk("z1"), &r1, false));
         assert!(!should_send_chunk(&chunk("z1"), &r2, false));
         assert!(should_send_chunk(&chunk("z2"), &r2, false));
+    }
+
+    #[test]
+    fn new_clients_start_on_the_first_playable_stream() {
+        let mut state = crate::state::ServerState::default();
+        for id in ["gone", "persisted", "b", "c"] {
+            state.streams.push(crate::state::StreamInfo {
+                id: id.into(),
+                status: "idle".into(),
+                uri: String::new(),
+                properties: Default::default(),
+            });
+        }
+        let playable = vec!["c".to_string(), "b".to_string()];
+        // The configured default wins while it can play.
+        assert_eq!(
+            SessionContext::default_stream_for(&state, "c", &playable),
+            "c"
+        );
+        // Removed at runtime: the first stream in the state that can play.
+        assert_eq!(
+            SessionContext::default_stream_for(&state, "gone", &playable),
+            "b"
+        );
+        // Nothing can play: keep the configured default.
+        assert_eq!(
+            SessionContext::default_stream_for(&state, "gone", &[]),
+            "gone"
+        );
     }
 }

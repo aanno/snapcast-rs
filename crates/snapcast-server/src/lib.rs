@@ -67,7 +67,7 @@ pub use snapcast_proto::{DEFAULT_SAMPLE_FORMAT, DEFAULT_STREAM_PORT};
 
 const EVENT_CHANNEL_SIZE: usize = 256;
 const COMMAND_CHANNEL_SIZE: usize = 64;
-const AUDIO_CHANNEL_SIZE: usize = 256;
+pub(crate) const AUDIO_CHANNEL_SIZE: usize = 256;
 
 /// Channel size for F32 embedded sources — backpressure from encoder pacing.
 const F32_CHANNEL_SIZE: usize = 1;
@@ -196,6 +196,7 @@ pub(crate) mod session;
 pub mod state;
 pub use state::ServerState;
 pub mod status;
+pub(crate) mod streams;
 pub mod time;
 
 /// Settings update pushed to a streaming client via binary protocol.
@@ -389,16 +390,56 @@ pub enum ServerCommand {
     },
     /// Request dynamic stream addition from an application shell.
     ///
-    /// The embeddable library does not own stream readers. Binaries or embedders
-    /// must create streams before [`SnapServer::serve`] or implement their own
-    /// orchestration around this command.
+    /// The embeddable library does not own stream readers, so it answers this
+    /// URI-based request (JSON-RPC `Stream.AddStream`) with an error. Binaries or
+    /// embedders create streams before [`SnapServer::serve`], or at runtime with
+    /// [`ServerCommand::AddAudioStream`] for audio they feed themselves.
     AddStream {
         /// Stream source URI (e.g. `pipe:///tmp/snapfifo?name=default`).
         uri: String,
         /// Response: the stream ID assigned.
         response_tx: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
-    /// Remove a stream source.
+    /// Add an audio stream fed by the embedder while the server runs: the
+    /// runtime counterpart of [`SnapServer::add_stream_with_config`].
+    ///
+    /// The server creates the stream's encoder, lists the stream in its state,
+    /// registers its codec with the sessions and answers with the sender for its
+    /// audio frames, then emits [`ServerEvent::StateChanged`] and
+    /// [`ServerEvent::ServerUpdated`]. No client is moved to the new stream;
+    /// assign groups with [`ServerCommand::SetGroupStream`].
+    ///
+    /// Errors (as text): the name is empty, a stream of that name is running,
+    /// or the codec or sample format in `config` is invalid.
+    ///
+    /// ```no_run
+    /// # async fn example(commands: tokio::sync::mpsc::Sender<snapcast_server::ServerCommand>) -> Result<(), Box<dyn std::error::Error>> {
+    /// use snapcast_server::{ServerCommand, StreamConfig};
+    ///
+    /// let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    /// commands
+    ///     .send(ServerCommand::AddAudioStream {
+    ///         name: "Zone2".into(),
+    ///         config: StreamConfig::default(),
+    ///         response_tx,
+    ///     })
+    ///     .await?;
+    /// let audio_tx = response_rx.await??;
+    /// # let _ = audio_tx;
+    /// # Ok(())
+    /// # }
+    /// ```
+    AddAudioStream {
+        /// Stream name (its id in the state and the JSON-RPC API).
+        name: String,
+        /// Codec and sample format; unset fields inherit from [`ServerConfig`].
+        config: StreamConfig,
+        /// Response: the sender for the stream's audio frames.
+        response_tx: tokio::sync::oneshot::Sender<Result<mpsc::Sender<AudioFrame>, String>>,
+    },
+    /// Remove a stream: it leaves the state, groups playing it are left without
+    /// a stream, and its encoder stops, so its audio sender reports the channel
+    /// as closed. The name can be added again afterwards.
     RemoveStream {
         /// Stream ID to remove.
         stream_id: String,
@@ -516,6 +557,7 @@ pub struct SnapServer {
 fn spawn_stream_encoder(
     stream_id: String,
     rx: mpsc::Receiver<AudioFrame>,
+    stop: tokio::sync::oneshot::Receiver<()>,
     enc: Box<dyn encoder::Encoder>,
     chunk_tx: broadcast::Sender<WireChunkData>,
     sample_rate: u32,
@@ -526,16 +568,20 @@ fn spawn_stream_encoder(
     std::thread::spawn(move || {
         tracing::dispatcher::with_default(&dispatch, || {
             span.in_scope(|| {
-                run_stream_encoder(stream_id, rx, enc, chunk_tx, sample_rate, channels);
+                run_stream_encoder(stream_id, rx, stop, enc, chunk_tx, sample_rate, channels);
             });
         });
     });
 }
 
 /// The encode loop of [`spawn_stream_encoder`], on its own current-thread runtime.
+///
+/// Ends when all senders of `rx` are dropped, or when `stop` fires or is
+/// dropped (the stream was removed, or the server stopped).
 fn run_stream_encoder(
     stream_id: String,
     mut rx: mpsc::Receiver<AudioFrame>,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
     mut enc: Box<dyn encoder::Encoder>,
     chunk_tx: broadcast::Sender<WireChunkData>,
     sample_rate: u32,
@@ -549,7 +595,14 @@ fn run_stream_encoder(
     tracing::debug!(stream = %stream_id, codec = enc.name(), "Stream encoder started");
     rt.block_on(async {
         let mut next_tick: Option<tokio::time::Instant> = None;
-        while let Some(frame) = rx.recv().await {
+        loop {
+            let frame = tokio::select! {
+                frame = rx.recv() => match frame {
+                    Some(frame) => frame,
+                    None => break,
+                },
+                _ = &mut stop => break,
+            };
             // Pace F32 sources to realtime (pipe sources pace naturally via blocking read)
             if let AudioData::F32(ref samples) = frame.data {
                 let num_frames = samples.len() / channels.max(1) as usize;
@@ -681,20 +734,17 @@ impl SnapServer {
             "Snapserver starting"
         );
 
-        // Create default encoder — used for codec header and first default stream
-        let default_enc_config = encoder::EncoderConfig {
-            codec: self.config.codec.clone(),
-            format: sample_format,
-            options: String::new(),
+        // Encoders and encode threads, now and for streams added at runtime.
+        let starter = streams::StreamStarter::new(
+            self.config.codec.clone(),
+            sample_format,
             #[cfg(feature = "encryption")]
-            encryption_psk: self.config.encryption_psk.clone(),
-        };
-        let default_enc = encoder::create(&default_enc_config)?;
-
-        // Spawn per-stream encode loops — reuse default_enc for first default stream
-        let chunk_tx = self.chunk_tx.clone();
+            self.config.encryption_psk.clone(),
+            self.chunk_tx.clone(),
+        );
+        // Create default encoder first, so an invalid codec fails before anything runs.
+        let mut default_enc = Some(starter.create_encoder(&StreamConfig::default())?);
         let streams = std::mem::take(&mut self.streams);
-        let mut default_enc = Some(default_enc);
 
         // Shared state for command handlers — seeded from the embedder-supplied
         // snapshot (the library reads no files).
@@ -702,7 +752,7 @@ impl SnapServer {
         let shared_state = Arc::new(tokio::sync::Mutex::new(initial_state));
 
         // Create session server before stream registration
-        // (first_stream_name set in loop below, but SessionServer only needs it for default routing)
+        // (SessionServer only needs the first stream's name, for default routing)
         let first_name = streams
             .first()
             .map(|(n, _, _)| n.clone())
@@ -716,53 +766,30 @@ impl SnapServer {
             send_audio_to_muted: self.config.send_audio_to_muted,
         }));
 
-        for (name, stream_cfg, rx) in streams {
+        // Spawn per-stream encode loops — reuse default_enc for the first default stream
+        for (name, mut stream_cfg, rx) in streams {
+            // Streams added before serve() fall back to the default format when
+            // theirs does not parse (runtime additions get an error instead).
+            if let Some(format) = &stream_cfg.sample_format
+                && format.parse::<snapcast_proto::SampleFormat>().is_err()
             {
-                let mut s = shared_state.lock().await;
-                if !s.streams.iter().any(|existing| existing.id == name) {
-                    s.streams.push(state::StreamInfo {
-                        id: name.clone(),
-                        status: "idle".into(),
-                        uri: String::new(),
-                        properties: Default::default(),
-                    });
-                }
+                tracing::warn!(stream = %name, format, "Invalid sample format, using the default");
+                stream_cfg.sample_format = None;
             }
-            let mut active_format = sample_format;
-            let enc = if stream_cfg.codec.is_none() && stream_cfg.sample_format.is_none() {
-                if let Some(enc) = default_enc.take() {
-                    enc
-                } else {
-                    encoder::create(&default_enc_config)?
+            let (enc, format) = match default_enc.take() {
+                Some(default)
+                    if stream_cfg.codec.is_none() && stream_cfg.sample_format.is_none() =>
+                {
+                    default
                 }
-            } else {
-                let stream_codec = stream_cfg.codec.as_deref().unwrap_or(&self.config.codec);
-                let stream_format: snapcast_proto::SampleFormat = stream_cfg
-                    .sample_format
-                    .as_deref()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(sample_format);
-                active_format = stream_format;
-                encoder::create(&encoder::EncoderConfig {
-                    codec: stream_codec.to_string(),
-                    format: stream_format,
-                    options: String::new(),
-                    #[cfg(feature = "encryption")]
-                    encryption_psk: self.config.encryption_psk.clone(),
-                })?
+                other => {
+                    default_enc = other;
+                    starter.create_encoder(&stream_cfg)?
+                }
             };
-            tracing::info!(stream = %name, codec = enc.name(), format = %active_format, "Stream registered");
-            session_srv
-                .register_stream_codec(&name, enc.name(), enc.header())
+            starter
+                .start(&name, enc, format, rx, &shared_state, &session_srv)
                 .await;
-            spawn_stream_encoder(
-                name,
-                rx,
-                enc,
-                chunk_tx.clone(),
-                active_format.rate(),
-                active_format.channels(),
-            );
         }
 
         let session_for_run = Arc::clone(&session_srv);
@@ -785,6 +812,7 @@ impl SnapServer {
             session_srv: Arc::clone(&session_srv),
             event_tx: event_tx.clone(),
             buffer_ms: self.config.buffer_ms as i32,
+            streams: starter,
         };
 
         // Main loop

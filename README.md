@@ -218,6 +218,16 @@ cmd.send(ServerCommand::DeleteClient { client_id }).await;
 let (tx, rx) = oneshot::channel();
 cmd.send(ServerCommand::GetStatus { response_tx: tx }).await;
 
+// Streams while running: add one you feed yourself, remove it again
+let (tx, rx) = oneshot::channel();
+cmd.send(ServerCommand::AddAudioStream {
+    name: "Zone3".into(),
+    config: StreamConfig::default(),
+    response_tx: tx,
+}).await;
+let zone3_tx = rx.await??; // like add_stream(): the sender for its audio
+cmd.send(ServerCommand::RemoveStream { stream_id: "Zone3".into() }).await;
+
 // Push f32 audio directly
 audio_tx.send(AudioFrame {
     data: AudioData::F32(samples),
@@ -638,7 +648,7 @@ Library crates published to [crates.io](https://crates.io): `snapcast-proto`, `s
 ## Known Limitations
 
 - **No WebSocket audio transport** — the server exposes JSON-RPC WebSockets at `/jsonrpc`, but binary audio streaming is TCP-only. The CLI rejects `ws://` and `wss://` for audio clients until a verified binary audio WebSocket contract is implemented.
-- **Dynamic `Stream.AddStream` is application-owned** — the embeddable server can expose and route streams created before `serve()`. Runtime `Stream.AddStream` returns an explicit error because the library does not own source readers after startup.
+- **Dynamic `Stream.AddStream` is application-owned** — the embeddable server can expose and route streams created before `serve()`, and streams the embedder feeds itself can be added and removed while it runs (`ServerCommand::AddAudioStream`, `ServerCommand::RemoveStream`). The URI-based `Stream.AddStream` of the JSON-RPC API returns an explicit error because the library does not own source readers after startup.
 - **Opus is a native optional feature** — `--features opus` requires system Opus discoverable by `pkg-config` or the native build tools needed by `audiopus_sys`.
 
 ## License

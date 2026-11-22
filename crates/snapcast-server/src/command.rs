@@ -11,7 +11,10 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::session::SessionServer;
 use crate::state::ServerState;
-use crate::{ClientSettingsUpdate, ServerCommand, ServerEvent};
+use crate::streams::StreamStarter;
+use crate::{
+    AUDIO_CHANNEL_SIZE, AudioFrame, ClientSettingsUpdate, ServerCommand, ServerEvent, StreamConfig,
+};
 
 /// The handles and config a command handler needs (everything but loop control).
 pub(crate) struct Dispatcher {
@@ -23,9 +26,37 @@ pub(crate) struct Dispatcher {
     pub(crate) event_tx: mpsc::Sender<ServerEvent>,
     /// Playout buffer size in milliseconds (pushed to clients).
     pub(crate) buffer_ms: i32,
+    /// Starts and stops the streams' encoders (runtime add and remove).
+    pub(crate) streams: StreamStarter,
 }
 
 impl Dispatcher {
+    /// Start a stream fed by the embedder while the server runs.
+    async fn add_audio_stream(
+        &self,
+        name: &str,
+        config: &StreamConfig,
+    ) -> Result<mpsc::Sender<AudioFrame>, String> {
+        if name.is_empty() {
+            return Err("the stream name is empty".into());
+        }
+        if self.streams.is_running(name) {
+            return Err(format!("stream '{name}' exists"));
+        }
+        let (enc, format) = self
+            .streams
+            .create_encoder(config)
+            .map_err(|e| format!("stream '{name}': {e}"))?;
+        let (tx, rx) = mpsc::channel(AUDIO_CHANNEL_SIZE);
+        self.streams
+            .start(name, enc, format, rx, &self.shared_state, &self.session_srv)
+            .await;
+        let snapshot = self.shared_state.lock().await.clone();
+        let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
+        let _ = self.event_tx.try_send(ServerEvent::ServerUpdated);
+        Ok(tx)
+    }
+
     /// Handle one command.
     ///
     /// `Stop`/`None` are handled by the run loop and never reach here.
@@ -185,7 +216,20 @@ impl Dispatcher {
                     "dynamic Stream.AddStream is not supported by the embeddable server after run(); create streams before run()".into(),
                 ));
             }
+            ServerCommand::AddAudioStream {
+                name,
+                config,
+                response_tx,
+            } => {
+                let result = self.add_audio_stream(&name, &config).await;
+                if let Err(e) = &result {
+                    tracing::warn!(stream = %name, error = %e, "Stream not added");
+                }
+                let _ = response_tx.send(result);
+            }
             ServerCommand::RemoveStream { stream_id } => {
+                self.streams.stop(&stream_id);
+                self.session_srv.unregister_stream_codec(&stream_id).await;
                 let mut s = self.shared_state.lock().await;
                 s.streams.retain(|st| st.id != stream_id);
                 // Clear stream_id on groups that referenced this stream
@@ -255,6 +299,13 @@ mod tests {
                 session_srv,
                 event_tx,
                 buffer_ms: 1000,
+                streams: StreamStarter::new(
+                    "pcm".into(),
+                    snapcast_proto::DEFAULT_SAMPLE_FORMAT,
+                    #[cfg(feature = "encryption")]
+                    None,
+                    tokio::sync::broadcast::channel(16).0,
+                ),
             },
             event_rx,
         )
@@ -506,6 +557,139 @@ mod tests {
         })
         .await;
         assert!(rx.await.unwrap().is_err());
+    }
+
+    /// Send `AddAudioStream` and return the answer.
+    async fn add_audio_stream(
+        d: &Dispatcher,
+        name: &str,
+        config: StreamConfig,
+    ) -> Result<mpsc::Sender<AudioFrame>, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        d.dispatch(ServerCommand::AddAudioStream {
+            name: name.into(),
+            config,
+            response_tx: tx,
+        })
+        .await;
+        rx.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn add_audio_stream_lists_the_stream_and_announces_it() {
+        let (d, mut rx) = dispatcher_with(ServerState::default());
+        let audio = add_audio_stream(&d, "zone2", StreamConfig::default()).await;
+        assert!(audio.is_ok());
+        assert!(
+            d.shared_state
+                .lock()
+                .await
+                .streams
+                .iter()
+                .any(|st| st.id == "zone2")
+        );
+        assert!(d.streams.is_running("zone2"));
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ServerEvent::StateChanged(_)))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ServerEvent::ServerUpdated))
+        );
+    }
+
+    #[tokio::test]
+    async fn add_audio_stream_rejects_a_running_name_and_bad_config() {
+        let (d, _rx) = dispatcher_with(ServerState::default());
+        let _audio = add_audio_stream(&d, "zone2", StreamConfig::default())
+            .await
+            .unwrap();
+        assert!(
+            add_audio_stream(&d, "zone2", StreamConfig::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            add_audio_stream(&d, "", StreamConfig::default())
+                .await
+                .is_err()
+        );
+        let bad_codec = StreamConfig {
+            codec: Some("bogus".into()),
+            ..StreamConfig::default()
+        };
+        assert!(add_audio_stream(&d, "zone3", bad_codec).await.is_err());
+        let bad_format = StreamConfig {
+            sample_format: Some("not:a:format".into()),
+            ..StreamConfig::default()
+        };
+        assert!(add_audio_stream(&d, "zone4", bad_format).await.is_err());
+        let s = d.shared_state.lock().await;
+        assert_eq!(s.streams.len(), 1, "failed additions leave no trace");
+    }
+
+    #[tokio::test]
+    async fn add_audio_stream_keeps_a_persisted_entry() {
+        let mut state = ServerState::default();
+        state.streams.push(StreamInfo {
+            id: "zone2".into(),
+            status: "idle".into(),
+            uri: String::new(),
+            properties: Default::default(),
+        });
+        let (d, _rx) = dispatcher_with(state);
+        add_audio_stream(&d, "zone2", StreamConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(d.shared_state.lock().await.streams.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn removed_stream_stops_and_can_be_added_again() {
+        let (d, _rx) = dispatcher_with(ServerState::default());
+        let audio = add_audio_stream(&d, "zone2", StreamConfig::default())
+            .await
+            .unwrap();
+        d.dispatch(ServerCommand::RemoveStream {
+            stream_id: "zone2".into(),
+        })
+        .await;
+        // The encode thread drops its receiver once stopped.
+        tokio::time::timeout(std::time::Duration::from_secs(2), audio.closed())
+            .await
+            .expect("the removed stream's encoder stops");
+        assert!(!d.streams.is_running("zone2"));
+        assert!(
+            add_audio_stream(&d, "zone2", StreamConfig::default())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_whose_senders_are_gone_can_be_added_again() {
+        let (d, _rx) = dispatcher_with(ServerState::default());
+        let audio = add_audio_stream(&d, "zone2", StreamConfig::default())
+            .await
+            .unwrap();
+        drop(audio);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while d.streams.is_running("zone2") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "encoder did not end"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            add_audio_stream(&d, "zone2", StreamConfig::default())
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
